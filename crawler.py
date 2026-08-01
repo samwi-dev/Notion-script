@@ -49,16 +49,40 @@ def plain(prop, key):
     return "".join(t.get("plain_text", "") for t in ((prop or {}).get(key) or []))
 
 
+def _norm(s):
+    """正規化名稱：去掉空白與符號，只留中英數字，全部小寫。"""
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", (s or "").lower())
+
+
 def find_database_id(name):
     res = notion_api("/search", {
         "query": name,
         "filter": {"value": "database", "property": "object"},
     })
+    target = _norm(name)
+    titles = []
     for item in res.get("results", []):
         title = "".join(t.get("plain_text", "") for t in item.get("title", []))
-        if title.strip() == name:
+        titles.append(title or "(無標題)")
+        n = _norm(title)
+        if n and (target in n or n in target):
             return item["id"]
-    raise RuntimeError("找不到資料庫「%s」，請確認已分享給 integration" % name)
+    # 再搜一次不帶 query，列出 integration 看得到的所有資料庫
+    res_all = notion_api("/search", {
+        "filter": {"value": "database", "property": "object"},
+        "page_size": 50,
+    })
+    for item in res_all.get("results", []):
+        title = "".join(t.get("plain_text", "") for t in item.get("title", []))
+        if title not in titles:
+            titles.append(title or "(無標題)")
+        n = _norm(title)
+        if n and (target in n or n in target):
+            return item["id"]
+    raise RuntimeError(
+        "找不到資料庫「%s」。integration 目前看得到的資料庫：[%s]。"
+        "請到包含設定表的頁面 → 右上角 ⋯ → Connections → 加入 integration"
+        % (name, ", ".join(titles) if titles else "無，什麼都看不到"))
 
 
 def extract_db_id(url):
@@ -315,3 +339,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+""" """
