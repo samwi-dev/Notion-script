@@ -23,8 +23,7 @@ jobs:
       - name: Run crawler
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NEWS_LIST_DB_ID: ${{ secrets.NEWS_LIST_DB_ID }}
-          MONITOR_DB_ID: ${{ secrets.MONITOR_DB_ID }}
+          CONFIG_DB_ID: ${{ secrets.CONFIG_DB_ID }}
         run: python crawler.py
 
       - name: Commit updated state
