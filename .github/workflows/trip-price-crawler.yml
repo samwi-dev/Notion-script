@@ -1,0 +1,30 @@
+name: Trip Price Crawler
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 01:00 UTC = 09:00 Asia/Taipei
+    - cron: "0 1 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  trip-price-crawler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Trip price crawler
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          TRIP_DATABASE_ID: ${{ secrets.TRIP_DATABASE_ID }}
+        run: python crawlers/trip_price/crawler.py
