@@ -24,10 +24,40 @@ jobs:
           python-version: "3.11"
 
       - name: Step 1 — Rebuild structure rows (flights + price sites)
+        id: step1
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           TRIP_DATABASE_ID: ${{ secrets.TRIP_DATABASE_ID }}
         run: python crawlers/trip_price/crawler.py
 
-      # Step 2 票價查詢改由 Notion AI 手動執行，不在此自動化
-      # 使用方式：直接向 Notion AI 說「更新 XXX 的票價」即可
+      - name: Step 2 — Notify Notion AI Agent (create log entry to trigger price fetch)
+        if: always()
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_PRICE_LOG_DB_ID: ${{ secrets.NOTION_PRICE_LOG_DB_ID }}
+        run: |
+          STATUS="✅ 成功"
+          NOTE="Step 1 完成，觸發 Notion AI 抓取票價"
+          if [ "${{ steps.step1.outcome }}" != "success" ]; then
+            STATUS="❌ 失敗"
+            NOTE="Step 1 失敗，請檢查 GitHub Actions 記錄"
+          fi
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          curl -s -X POST https://api.notion.com/v1/pages \
+            -H "Authorization: Bearer ${NOTION_TOKEN}" \
+            -H "Notion-Version: 2022-06-28" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"parent\": { \"database_id\": \"${NOTION_PRICE_LOG_DB_ID}\" },
+              \"properties\": {
+                \"\u57f7\u884c\u6642\u9593\": {
+                  \"title\": [{ \"text\": { \"content\": \"${NOW}\" } }]
+                },
+                \"\u72c0\u614b\": {
+                  \"select\": { \"name\": \"${STATUS}\" }
+                },
+                \"\u5099\u8a3b\": {
+                  \"rich_text\": [{ \"text\": { \"content\": \"${NOTE}\" } }]
+                }
+              }
+            }"
