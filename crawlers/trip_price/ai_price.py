@@ -1,43 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ai_price.py — samwi-dev/Notion-script · crawlers/trip_price
+"""ai_price.py - samwi-dev/Notion-script / crawlers/trip_price
 
-用途：
-  1. 對 Trip database 每個 Journey Task 頁面內的「票價網站資料」database，
-     找出尚未有票價（票價欄位為空）的列。
-  2. 用 DuckDuckGo HTML 搜尋取得該網站 + 路線的票價摘要（純 Python 標準庫）。
-  3. 呼叫 GitHub Models inference API（workflow 內建 GITHUB_TOKEN，需 models: read 權限），
-     讓 AI 從搜尋摘要中擷取票價並回傳 JSON。
-  4. 把 TWD 票價、備註（含原始幣別與換算依據）、查詢時間回填進 Notion。
+Flow:
+  1. Find rows in ticket_price_db where price is empty
+  2. DuckDuckGo HTML search (pure Python stdlib, no extra packages)
+  3. Regex extract price numbers, convert to TWD
+  4. Backfill price / note / query_time into Notion
 
-Required env:
-  NOTION_TOKEN   — Notion integration secret
-  TRIP_DATABASE_ID — Trip database ID
-  GITHUB_TOKEN   — 由 GitHub Actions 自動注入，需要 models: read 權限
+Required secrets:
+  NOTION_TOKEN
+  TRIP_DATABASE_ID
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 NOTION_VERSION = "2022-06-28"
 WRITE_DELAY_SEC = 0.4
-SEARCH_DELAY_SEC = 2.0   # DuckDuckGo 之間的間隔，避免被封
-GH_MODELS_API = "https://models.inference.ai.azure.com/chat/completions"
-GH_MODEL = "gpt-4o-mini"
-USD_TO_TWD = 32.4        # 換算匯率（每次執行固定值，備註中說明）
-THB_TO_TWD = 0.9         # 1 THB ≈ 0.9 TWD 約略值
+SEARCH_DELAY_SEC = 3.0
+
+USD_TO_TWD = 32.4
+THB_TO_TWD = 0.9
 
 
-# ─── Notion helpers ─────────────────────────────────────────────────────────
+# --- Notion helpers ---
 
 def env(name: str) -> Optional[str]:
     v = os.environ.get(name)
@@ -55,18 +52,14 @@ def notion_headers() -> Dict[str, str]:
     }
 
 
-def http_json(method: str, url: str, payload: Optional[dict] = None,
-              extra_headers: Optional[Dict[str, str]] = None) -> dict:
+def http_json(method: str, url: str, payload: Optional[dict] = None) -> dict:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    headers = notion_headers() if "notion.com" in url else {"Content-Type": "application/json"}
-    if extra_headers:
-        headers.update(extra_headers)
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    req = urllib.request.Request(url, data=data, method=method, headers=notion_headers())
     try:
-        with urllib.request.urlopen(req, timeout=60) as res:
+        with urllib.request.urlopen(req, timeout=45) as res:
             return json.loads(res.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:500]
+        body = e.read().decode("utf-8", errors="replace")[:400]
         raise RuntimeError(f"{method} {url} -> HTTP {e.code}: {body}") from e
 
 
@@ -90,7 +83,11 @@ def query_all_pages(database_id: str) -> List[dict]:
         payload: Dict[str, Any] = {"page_size": 100}
         if cursor:
             payload["start_cursor"] = cursor
-        data = http_json("POST", f"https://api.notion.com/v1/databases/{database_id}/query", payload)
+        data = http_json(
+            "POST",
+            f"https://api.notion.com/v1/databases/{database_id}/query",
+            payload,
+        )
         pages.extend(data.get("results", []))
         if not data.get("has_more"):
             break
@@ -126,150 +123,152 @@ def find_child_databases(page_id: str) -> Dict[str, str]:
 
 
 def update_page_props(page_id: str, props: dict) -> None:
-    http_json("PATCH", f"https://api.notion.com/v1/pages/{page_id}",
-              {"properties": props})
+    http_json(
+        "PATCH",
+        f"https://api.notion.com/v1/pages/{page_id}",
+        {"properties": props},
+    )
     time.sleep(WRITE_DELAY_SEC)
 
 
-# ─── DuckDuckGo search (stdlib only) ─────────────────────────────────────────
+# --- DuckDuckGo search (stdlib only) ---
 
-def ddg_search(query: str, max_results: int = 5) -> str:
-    """回傳純文字摘要（各結果 title + snippet 合併）。"""
+def ddg_search(query: str, max_results: int = 8) -> str:
     url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query)
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (compatible; NotionPriceCrawler/1.0)",
-        "Accept-Language": "zh-TW,en;q=0.9",
-    })
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+            "Accept-Language": "zh-TW,en;q=0.9",
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=30) as res:
             html = res.read().decode("utf-8", errors="replace")
     except Exception as e:
-        return f"搜尋失敗: {e}"
+        return f"search failed: {e}"
 
-    # 粗略從 HTML 取出文字段落（不依賴 BeautifulSoup）
-    import re
-    # 取 result__snippet 內容
     snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.S)
-    titles = re.findall(r'class="result__title[^"]*"[^>]*>.*?<a[^>]*>(.*?)</a>', html, re.S)
-    tag_re = re.compile(r'<[^>]+>')
-    clean = lambda s: tag_re.sub('', s).strip()
+    titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', html, re.S)
+    tag_re = re.compile(r"<[^>]+>")
+
+    def clean(s: str) -> str:
+        return tag_re.sub("", s).strip()
 
     parts = []
     for i, (t, s) in enumerate(zip(titles, snippets)):
         if i >= max_results:
             break
-        parts.append(f"[{i+1}] {clean(t)} — {clean(s)}")
-    return "\n".join(parts) if parts else "（無搜尋結果）"
+        parts.append(f"[{i+1}] {clean(t)} -- {clean(s)}")
+    return "\n".join(parts) if parts else "(no results)"
 
 
-# ─── GitHub Models (AI inference) ─────────────────────────────────────────────
+# --- Price extraction via regex ---
 
-def ai_extract_price(site: str, route: str, date_range: str, snippets: str) -> Dict[str, Any]:
-    """呼叫 GitHub Models API，從搜尋摘要擷取票價，回傳 dict。
+def extract_price_twd(text: str) -> Tuple[Optional[int], str]:
+    """Find the lowest plausible flight price in text, convert to TWD."""
+    candidates: List[Tuple[int, str, str]] = []  # (twd, original, currency)
 
-    回傳格式 (JSON):
-    {
-      "price_twd": <int or null>,
-      "original_price": "<原始金額 + 幣別>",
-      "currency": "<TWD/USD/THB/...>",
-      "exchange_rate": "<換算說明>",
-      "note": "<備註，含是否含稅、行李、轉機等>"
-    }
-    """
-    github_token = env("GITHUB_TOKEN")
-    if not github_token:
-        return {"price_twd": None, "note": "Missing GITHUB_TOKEN"}
+    # NT$ / TWD / NTD / Chinese
+    for m in re.finditer(
+        r"(?:NT\$|TWD|NTD|\u65b0\u53f0\u5e63|\u53f0\u5e63)[\s]*([\d,]+)", text
+    ):
+        val = int(m.group(1).replace(",", ""))
+        if 3000 <= val <= 200000:
+            candidates.append((val, m.group(0), "TWD"))
 
-    system_prompt = (
-        "你是機票票價解析助手。從提供的搜尋摘要中，找出最接近指定路線與日期的票價。"
-        "若找不到具體票價，price_twd 回傳 null。"
-        "所有價格統一換算為新台幣（TWD），換算匯率：1 USD = 32.4 TWD，1 THB = 0.9 TWD。"
-        "回傳純 JSON，不要加任何說明文字或 markdown。"
+    # THB
+    for m in re.finditer(
+        r"(?:THB|\u6cf0\u9296|\u0e3f)[\s]*([\d,]+)", text
+    ):
+        val = int(m.group(1).replace(",", ""))
+        twd = int(val * THB_TO_TWD)
+        if 3000 <= twd <= 200000:
+            candidates.append(
+                (twd, f"{m.group(0)} (~TWD {twd:,}, rate 1 THB=0.9 TWD)", "THB")
+            )
+
+    # USD / US$
+    for m in re.finditer(r"(?:USD|US\$|\$)[\s]*([\d,]+(?:\.\d+)?)", text):
+        try:
+            val = float(m.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        twd = int(val * USD_TO_TWD)
+        if 3000 <= twd <= 200000:
+            candidates.append(
+                (twd, f"{m.group(0)} (~TWD {twd:,}, rate 1 USD=32.4 TWD)", "USD")
+            )
+
+    # Bare numbers near price keywords
+    price_kw = re.compile(
+        r"(?:price|fare|\u7968\u50f9|\u6a5f\u7968|\u8cbb\u7528|\u8d77|from|\u5143|\u5e63)",
+        re.IGNORECASE,
     )
-    user_prompt = (
-        f"比價網站：{site}\n"
-        f"路線：{route}\n"
-        f"日期：{date_range}\n\n"
-        f"搜尋摘要：\n{snippets}\n\n"
-        "請回傳 JSON：{\"price_twd\": <int or null>, \"original_price\": \"<金額+幣別>\", "
-        "\"currency\": \"TWD\", \"exchange_rate\": \"<換算說明>\", \"note\": \"<備註>\"}"
-    )
+    for m in re.finditer(r"\b([1-9]\d{3,5})\b", text):
+        val = int(m.group(1))
+        if 3000 <= val <= 80000:
+            start = max(0, m.start() - 80)
+            end = min(len(text), m.end() + 80)
+            if price_kw.search(text[start:end]):
+                candidates.append(
+                    (val, f"{val} (inferred TWD from context)", "TWD-inferred")
+                )
 
-    payload = {
-        "model": GH_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.2,
-        "max_tokens": 300,
-    }
-    headers = {
-        "Authorization": f"Bearer {github_token}",
-        "Content-Type": "application/json",
-    }
-    try:
-        data = http_json("POST", GH_MODELS_API, payload, extra_headers=headers)
-        content = data["choices"][0]["message"]["content"].strip()
-        # 去除可能的 markdown code block
-        if content.startswith("```"):
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-        return json.loads(content)
-    except Exception as e:
-        return {"price_twd": None, "note": f"AI 解析失敗: {e}"}
+    if not candidates:
+        return None, "regex: no price found in search snippets"
+
+    candidates.sort(key=lambda x: x[0])
+    best = candidates[0]
+    return best[0], f"\u539f\u59cb\u5831\u50f9: {best[1]} | \u5e63\u5225: {best[2]}"
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# --- Core logic ---
 
 def process_price_db(price_db_id: str, journey_info: Dict[str, str]) -> int:
-    """找出票價為空的列，查價後回填。回傳回填筆數。"""
     rows = query_all_pages(price_db_id)
     updated = 0
-    route = f"{journey_info['origin']} → {journey_info['destination']}"
-    date_range = f"{journey_info['start']} – {journey_info['end']}"
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     for row in rows:
-        price_str = text_prop(row, "票價")
-        if price_str:  # 已有票價，跳過
+        # Skip rows that already have a price
+        price_val = row.get("properties", {}).get("\u7968\u50f9", {}).get("number")
+        if price_val is not None:
             continue
 
-        site_title = text_prop(row, "網站名稱")
-        # 從標題取出網站名稱（格式：「網站名稱｜路線｜日期」）
-        site_name = site_title.split("｜")[0].strip() if "｜" in site_title else site_title
+        site_title = text_prop(row, "\u7db2\u7ad9\u540d\u7a31")
+        site_name = (
+            site_title.split("\uff5c")[0].strip() if "\uff5c" in site_title else site_title
+        )
 
-        print(f"    Searching: {site_name} ...")
-        query = f"{site_name} {journey_info['origin']} {journey_info['destination']} 機票 {journey_info['start']} 含行李"
+        query = (
+            f"{site_name} "
+            f"{journey_info['origin_city']} {journey_info['dest_city']} "
+            f"\u6a5f\u7968 {journey_info['start']} \u76f4\u98db \u542b\u6258\u904b\u884c\u674e \u50f9\u683c"
+        )
+        print(f"    [{site_name}] searching...")
         snippets = ddg_search(query)
         time.sleep(SEARCH_DELAY_SEC)
 
-        result = ai_extract_price(site_name, route, date_range, snippets)
-        price_twd = result.get("price_twd")
-        note_text = (
-            f"原始報價：{result.get('original_price', 'N/A')}｜"
-            f"換算：{result.get('exchange_rate', f'1 USD=32.4 TWD, 1 THB=0.9 TWD')}｜"
-            f"{result.get('note', '')}"
-        )[:2000]
+        price_twd, note = extract_price_twd(snippets)
 
-        now_iso = datetime.now(timezone.utc).isoformat()
         props: Dict[str, Any] = {
-            "查詢時間": {"date": {"start": now_iso}},
-            "備註": {"rich_text": [{"text": {"content": note_text}}]},
+            "\u67e5\u8a62\u6642\u9593": {"date": {"start": now_iso}},
+            "\u5099\u8a3b": {"rich_text": [{"text": {"content": note[:2000]}}]},
         }
         if price_twd is not None:
-            props["票價"] = {"number": int(price_twd)}
-            props["幣別"] = {"select": {"name": "TWD"}}
-            print(f"      → TWD {price_twd:,}")
+            props["\u7968\u50f9"] = {"number": price_twd}
+            props["\u5e63\u5225"] = {"select": {"name": "TWD"}}
+            print(f"      -> TWD {price_twd:,}")
         else:
-            print(f"      → 無法取得票價（{result.get('note', '')}）")
+            print(f"      -> no price ({note})")
 
         page_id = row["id"]
         try:
             update_page_props(page_id, props)
             updated += 1
         except Exception as e:
-            print(f"      ⚠️  回填失敗: {e}")
+            print(f"      WARNING backfill failed: {e}")
 
     return updated
 
@@ -286,23 +285,39 @@ def main() -> int:
 
     for page in journeys:
         props = page.get("properties", {})
-        title_prop = props.get("Deal Title") or {}
-        title = "".join(t.get("plain_text", "") for t in title_prop.get("title", []))
-        print(f"Journey: {title}")
-
+        title = "".join(
+            t.get("plain_text", "")
+            for t in (props.get("Deal Title") or {}).get("title", [])
+        )
+        from_to = "".join(
+            t.get("plain_text", "")
+            for t in (props.get("From-To") or {}).get("rich_text", [])
+        )
         trip_date = (props.get("Trip Date") or {}).get("date") or {}
-        info = {
+        start = trip_date.get("start") or ""
+        end = trip_date.get("end") or ""
+
+        # Parse city names for search queries
+        origin_city = "\u53f0\u5317"
+        dest_city = "\u6e05\u9081"
+        if "\u2192" in from_to:
+            left, right = from_to.split("\u2192", 1)
+            origin_city = left.strip()
+            dest_city = right.strip()
+
+        info: Dict[str, str] = {
             "title": title,
-            "origin": "TPE",
-            "destination": "CNX",
-            "start": trip_date.get("start") or "",
-            "end": trip_date.get("end") or "",
+            "origin_city": origin_city,
+            "dest_city": dest_city,
+            "start": start,
+            "end": end,
         }
 
+        print(f"Journey: {title}")
         dbs = find_child_databases(page["id"])
-        price_db = dbs.get("票價網站資料")
+        price_db = dbs.get("\u7968\u50f9\u7db2\u7ad9\u8cc7\u6599")
         if not price_db:
-            print("  Skip: no 票價網站資料 child database.")
+            print("  Skip: no child database named \u7968\u50f9\u7db2\u7ad9\u8cc7\u6599")
             continue
 
         count = process_price_db(price_db, info)
