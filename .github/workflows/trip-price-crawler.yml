@@ -3,7 +3,7 @@ name: Trip Price Crawler
 on:
   workflow_dispatch:
   schedule:
-    # 01:00 UTC = 09:00 Asia/Taipei
+    # 01:00 UTC = 09:00 Asia/Taipei，每天執行（只跑 Step 1 結構維護，0 credit）
     - cron: "0 1 * * *"
 
 permissions:
@@ -30,12 +30,21 @@ jobs:
           TRIP_DATABASE_ID: ${{ secrets.TRIP_DATABASE_ID }}
         run: python crawlers/trip_price/crawler.py
 
-      - name: Step 2 — Notify Notion AI Agent (create log entry to trigger price fetch)
+      # Step 2 — 觸發 Notion AI 抓票價（會用到 Notion AI credit）
+      # 為節省 credit，只在以下情況執行：
+      #   1. 每週一（自動，每週只用 1 次 credit）
+      #   2. 手動 Run workflow（想更新票價時隨時可觸發）
+      - name: Step 2 — Notify Notion AI Agent (weekly or manual only)
         if: always()
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_PRICE_LOG_DB_ID: ${{ secrets.NOTION_PRICE_LOG_DB_ID }}
         run: |
+          # 只在週一或手動觸發時執行，其餘日子直接跳過（省 credit）
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ "$(date -u +%u)" != "1" ]; then
+            echo "Skip: 節省 Notion AI credit，只在週一或手動觸發時通知 Agent"
+            exit 0
+          fi
           STATUS="✅ 成功"
           NOTE="Step 1 完成，觸發 Notion AI 抓取票價"
           if [ "${{ steps.step1.outcome }}" != "success" ]; then
