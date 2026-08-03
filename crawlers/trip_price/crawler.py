@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Trip price crawler — under samwi-dev/Notion-script
+"""Trip price crawler — samwi-dev/Notion-script · crawlers/trip_price
 
-Purpose:
-- Read Trip crawler request rows from the Notion Trip database.
-- For the first request: Taiwan → Chiang Mai, 2026-10-22 to 2026-10-26,
-  direct flight, return flight must include checked baggage.
-- Create platform-specific search rows back into the same Trip database.
+2026-08 重寫版，對齊目前 Notion 架構：
+- TRIP_DATABASE_ID 指向 Trip database；每一列 = 一個 Journey Task（一個旅程只保留一個 Task）
+- 每個 Journey Task 頁面內嵌兩個子 database：
+  - 「 票價網站資料」：各比價網站報價（linked view「整月價格走勢」chart 的資料來源）
+  - 「航班追蹤」：本旅程航班（page icon 使用航空公司官網 favicon）
+- 爬蟲負責「重建結構」：補齊航班追蹤的直飛航空公司、票價網站資料的各網站報價列
+- 去重：航班追蹤以「航空公司」title、票價網站資料以「網站名稱」前綴判斷，可每日重複執行
+- 實際價格由比價流程查詢後回填（統一 TWD，備註保留原始幣別與換算依據）
 
 Required GitHub Actions secrets:
 - NOTION_TOKEN
@@ -15,48 +18,40 @@ Required GitHub Actions secrets:
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import sys
+import time
 import urllib.parse
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 NOTION_VERSION = "2022-06-28"
+WRITE_DELAY_SEC = 0.35
 
-FLIGHT_PLATFORMS = [
-    ("Google Flights", "https://www.google.com/travel/flights"),
-    ("Skyscanner", "https://www.skyscanner.com.tw"),
-    ("Trip.com", "https://www.trip.com/flights"),
-    ("Klook", "https://www.klook.com"),
-    ("Expedia", "https://www.expedia.com/Flights"),
-    ("Traveloka", "https://www.traveloka.com/en-en/flight"),
-    ("Kayak", "https://www.kayak.com/flights"),
-    ("Momondo", "https://www.momondo.com/flight-search"),
-    ("EVA Air", "https://www.evaair.com"),
-    ("China Airlines", "https://www.china-airlines.com"),
-    ("STARLUX Airlines", "https://www.starlux-airlines.com"),
-    ("Tigerair Taiwan", "https://www.tigerairtw.com"),
-    ("Thai Airways", "https://www.thaiairways.com"),
-    ("AirAsia", "https://www.airasia.com"),
+FLIGHT_PRICE_SITES = [
+    ("Google Flights", "https://www.google.com/travel/flights", "多家航空公司比價"),
+    ("Skyscanner", "https://www.skyscanner.com.tw", "多家航空公司比價"),
+    ("Trip.com", "https://www.trip.com/flights", "多家航空公司比價"),
+    ("KAYAK", "https://www.kayak.com/flights", "多家航空公司比價"),
+    ("Expedia", "https://www.expedia.com/Flights", "多家航空公司比價"),
+    ("momondo", "https://www.momondo.com/flight-search", "多家航空公司比價"),
+    ("Booking.com", "https://www.booking.com/flights", "多家航空公司比價"),
+    ("ezTravel 易遊網", "https://www.eztravel.com.tw", "多家航空公司比價"),
+    ("EVA Air 長榮航空", "https://www.evaair.com", "EVA Air 長榮航空"),
+    ("China Airlines 中華航空", "https://www.china-airlines.com", "China Airlines 中華航空"),
+    ("STARLUX Airlines 星宇航空", "https://www.starlux-airlines.com", "STARLUX Airlines 星宇航空"),
+    ("Thai AirAsia 泰國亞洲航空", "https://www.airasia.com", "Thai AirAsia 泰國亞洲航空"),
 ]
 
-HOTEL_PLATFORMS = [
-    ("Google Travel / Hotel Search", "https://www.google.com/travel/hotels"),
-    ("Agoda", "https://www.agoda.com"),
-    ("Booking.com", "https://www.booking.com"),
-    ("Trip.com", "https://www.trip.com/hotels"),
-    ("Klook", "https://www.klook.com"),
-    ("Expedia", "https://www.expedia.com/Hotels"),
-    ("Hotels.com", "https://www.hotels.com"),
-    ("Trivago", "https://www.trivago.com"),
-    ("Kayak Hotels", "https://www.kayak.com/hotels"),
-    ("Momondo Hotels", "https://www.momondo.com/hotels"),
+CNX_AIRLINES = [
+    ("EVA Air 長榮航空", "www.evaair.com", "BR", "TPE", "CNX"),
+    ("China Airlines 中華航空", "www.china-airlines.com", "CI", "TPE", "CNX"),
+    ("STARLUX Airlines 星宇航空", "www.starlux-airlines.com", "JX", "TPE", "CNX"),
+    ("Thai AirAsia 泰國亞洲航空", "www.airasia.com", "FD", "TPE", "CNX"),
 ]
-
-SOURCE_SELECT_OPTIONS = {"Google Flights", "Skyscanner", "Trip.com", "Agoda", "Booking.com", "Klook", "Other"}
 
 
 def env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -76,10 +71,14 @@ def notion_headers() -> Dict[str, str]:
 
 
 def http_json(method: str, url: str, payload: Optional[dict] = None) -> dict:
-    data = json.dumps(payload or {}).encode("utf-8") if payload is not None else None
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers=notion_headers())
-    with urllib.request.urlopen(req, timeout=45) as res:
-        return json.loads(res.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=45) as res:
+            return json.loads(res.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Notion API {method} {url} -> HTTP {e.code}: {body}") from e
 
 
 def text_prop(page: dict, name: str) -> str:
@@ -91,22 +90,8 @@ def text_prop(page: dict, name: str) -> str:
         return "".join(t.get("plain_text", "") for t in prop.get("rich_text", []))
     if typ == "select" and prop.get("select"):
         return prop["select"].get("name", "")
-    if typ == "status" and prop.get("status"):
-        return prop["status"].get("name", "")
     if typ == "url":
         return prop.get("url") or ""
-    return ""
-
-
-def number_prop(page: dict, name: str) -> Optional[float]:
-    prop = page.get("properties", {}).get(name, {})
-    return prop.get("number") if prop.get("type") == "number" else None
-
-
-def date_start_prop(page: dict, name: str) -> str:
-    prop = page.get("properties", {}).get(name, {})
-    if prop.get("type") == "date" and prop.get("date"):
-        return prop["date"].get("start") or ""
     return ""
 
 
@@ -118,43 +103,11 @@ def notion_text(value: str) -> dict:
     return {"rich_text": [{"text": {"content": value[:2000]}}]}
 
 
-def notion_select(value: str) -> dict:
-    return {"select": {"name": value if value in SOURCE_SELECT_OPTIONS else "Other"}}
-
-
-def notion_deal_type(value: str) -> dict:
-    return {"select": {"name": value}}
-
-
-def notion_status(value: str) -> dict:
-    return {"status": {"name": value}}
-
-
-def notion_date(value: str) -> dict:
-    return {"date": {"start": value} if value else None}
-
-
-def notion_now() -> dict:
-    return {"date": {"start": datetime.now(timezone.utc).isoformat()}}
-
-
-def duplicate_key(*parts: str) -> str:
-    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:28]
-
-
-def build_search_url(base: str, query: str) -> str:
-    sep = "&" if "?" in base else "?"
-    return base + sep + "q=" + urllib.parse.quote(query)
-
-
-def query_request_pages(database_id: str) -> List[dict]:
+def query_all_pages(database_id: str) -> List[dict]:
     pages: List[dict] = []
     cursor = None
     while True:
-        payload: Dict[str, Any] = {
-            "page_size": 100,
-            "filter": {"property": "Status", "status": {"equals": "New"}},
-        }
+        payload: Dict[str, Any] = {"page_size": 100}
         if cursor:
             payload["start_cursor"] = cursor
         data = http_json("POST", f"https://api.notion.com/v1/databases/{database_id}/query", payload)
@@ -165,122 +118,142 @@ def query_request_pages(database_id: str) -> List[dict]:
     return pages
 
 
-def existing_keys(database_id: str) -> set[str]:
-    keys: set[str] = set()
+def list_block_children(block_id: str) -> List[dict]:
+    blocks: List[dict] = []
     cursor = None
     while True:
-        payload: Dict[str, Any] = {"page_size": 100}
+        url = f"https://api.notion.com/v1/blocks/{block_id}/children?page_size=100"
         if cursor:
-            payload["start_cursor"] = cursor
-        data = http_json("POST", f"https://api.notion.com/v1/databases/{database_id}/query", payload)
-        for page in data.get("results", []):
-            key = text_prop(page, "Duplicate Key")
-            if key:
-                keys.add(key)
+            url += "&start_cursor=" + urllib.parse.quote(cursor)
+        data = http_json("GET", url)
+        blocks.extend(data.get("results", []))
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
-    return keys
+    return blocks
 
 
-def create_page(database_id: str, props: dict, content: str) -> None:
-    http_json(
-        "POST",
-        "https://api.notion.com/v1/pages",
-        {
-            "parent": {"database_id": database_id},
-            "properties": props,
-            "children": [{
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {"rich_text": [{"type": "text", "text": {"content": content[:2000]}}]},
-            }],
-        },
-    )
-
-
-def update_page_status(page_id: str, status: str, notes: str) -> None:
-    http_json(
-        "PATCH",
-        f"https://api.notion.com/v1/pages/{page_id}",
-        {"properties": {"Status": notion_status(status), "Notes": notion_text(notes)}},
-    )
-
-
-def create_flight_platform_rows(database_id: str, request: dict, keys: set[str]) -> int:
-    origin = text_prop(request, "Origin") or "Taiwan TPE TSA"
-    destination = text_prop(request, "Destination") or "Chiang Mai CNX"
-    depart = date_start_prop(request, "Departure Date")
-    ret = date_start_prop(request, "Return Date")
-    keyword = text_prop(request, "Keyword") or f"{origin} {destination} direct flight {depart} {ret} checked baggage"
-    query = f"{origin} to {destination} direct flight {depart} {ret} return checked baggage"
-    created = 0
-    for rank, (source, base_url) in enumerate(FLIGHT_PLATFORMS, start=1):
-        key = duplicate_key("flight-search", source, origin, destination, depart, ret, "return-baggage")
-        if key in keys:
+def find_child_databases(page_id: str) -> Dict[str, str]:
+    """回傳 {title: database_id}。只收頁面內嵌的子 database，排除 linked view（標題為 'View of ...'）。"""
+    found: Dict[str, str] = {}
+    for block in list_block_children(page_id):
+        if block.get("type") != "child_database":
             continue
-        url = build_search_url(base_url, query)
-        title = f"[{rank}] {source}｜{origin} → {destination}｜{depart}–{ret}｜直飛＋回程託運"
+        title = block.get("child_database", {}).get("title", "")
+        if title.startswith("View of "):
+            continue
+        found[title.strip()] = block["id"]
+    return found
+
+
+def parse_journey(page: dict) -> Dict[str, str]:
+    props = page.get("properties", {})
+    title = text_prop(page, "Deal Title")
+    from_to = text_prop(page, "From-To")
+    summary = text_prop(page, "Summary")
+    trip_date = (props.get("Trip Date") or {}).get("date") or {}
+    start = trip_date.get("start") or ""
+    end = trip_date.get("end") or ""
+    origin, destination = "", ""
+    if "→" in from_to:
+        left, right = from_to.split("→", 1)
+        origin, destination = left.strip(), right.strip()
+    if not destination:
+        destination = title
+    return {
+        "title": title,
+        "from_to": from_to,
+        "summary": summary,
+        "origin": origin,
+        "destination": destination,
+        "start": start,
+        "end": end,
+    }
+
+
+def existing_titles(database_id: str, prop: str) -> Set[str]:
+    titles: Set[str] = set()
+    for page in query_all_pages(database_id):
+        value = text_prop(page, prop)
+        if value:
+            titles.add(value)
+    return titles
+
+
+def create_db_row(database_id: str, props: dict, icon: Optional[dict] = None) -> None:
+    payload: Dict[str, Any] = {"parent": {"database_id": database_id}, "properties": props}
+    if icon:
+        payload["icon"] = icon
+    http_json("POST", "https://api.notion.com/v1/pages", payload)
+    time.sleep(WRITE_DELAY_SEC)
+
+
+def favicon_icon(domain: str) -> dict:
+    return {"type": "external", "external": {"url": f"https://www.google.com/s2/favicons?domain={domain}&sz=128"}}
+
+
+def build_search_url(base: str, query: str) -> str:
+    sep = "&" if "?" in base else "?"
+    return base + sep + "q=" + urllib.parse.quote(query)
+
+
+def airlines_for_route(info: Dict[str, str]) -> List[tuple]:
+    text = f"{info['destination']} {info['title']} {info['summary']}"
+    if any(k in text for k in ("清邁", "Chiang Mai", "CNX")):
+        return CNX_AIRLINES
+    return []
+
+
+def rebuild_flight_rows(flight_db: str, info: Dict[str, str]) -> int:
+    airlines = airlines_for_route(info)
+    if not airlines:
+        print(f"  Skip flights: no airline mapping for route '{info['from_to'] or info['title']}'.")
+        return 0
+    existing = existing_titles(flight_db, "航空公司")
+    created = 0
+    for name, domain, code, dep_airport, arr_airport in airlines:
+        if name in existing:
+            continue
         props = {
-            "Deal Title": notion_title(title),
-            "Deal Type": notion_deal_type("Flight"),
-            "Status": notion_status("Reviewing"),
-            "Origin": notion_text(origin),
-            "Destination": notion_text(destination),
-            "Country / Region": notion_text("Thailand"),
-            "Departure Date": notion_date(depart),
-            "Return Date": notion_date(ret),
-            "Source": notion_select(source),
-            "URL": {"url": url},
-            "Keyword": notion_text(keyword),
-            "Summary": notion_text("待確認：直飛航班、價格、班機時間、回程託運行李是否包含。"),
-            "Fetched At": notion_now(),
-            "Duplicate Key": notion_text(key),
-            "Notified": {"checkbox": False},
-            "Notes": notion_text(f"平台：{source}。條件：直飛；回程需包含託運行李。確認價格是否含稅、含行李與是否跳價。"),
+            "航空公司": notion_title(name),
+            "到達機場": notion_text(arr_airport),
+            "航班時間": notion_text(f"{info['start']} → {info['end']}（實際班表待查）"),
+            "直飛還是轉機": {"select": {"name": "直飛"}},
+            "是否包含行李": {"checkbox": False},
         }
-        content = f"Search URL: {url}\nRequired fields: price, airline, flight number, departure/arrival time, duration, direct, return checked baggage."
-        create_page(database_id, props, content)
-        keys.add(key)
+        create_db_row(flight_db, props, icon=favicon_icon(domain))
+        existing.add(name)
         created += 1
+    print(f"  Flights: +{created} row(s).")
     return created
 
 
-def create_hotel_platform_rows(database_id: str, request: dict, keys: set[str]) -> int:
-    destination = text_prop(request, "Destination") or "Chiang Mai"
-    depart = date_start_prop(request, "Departure Date")
-    ret = date_start_prop(request, "Return Date")
-    nights = number_prop(request, "Nights") or 4
-    query = f"{destination} hotel {depart} {ret} {int(nights)} nights"
+def rebuild_price_site_rows(price_db: str, info: Dict[str, str]) -> int:
+    if not info["start"]:
+        print(f"  Skip price sites: journey '{info['title']}' has no Trip Date.")
+        return 0
+    existing = existing_titles(price_db, "網站名稱")
+    query = f"{info['origin']} to {info['destination']} direct flight {info['start']} {info['end']} return checked baggage"
+    now_iso = datetime.now(timezone.utc).isoformat()
     created = 0
-    for rank, (source, base_url) in enumerate(HOTEL_PLATFORMS, start=1):
-        key = duplicate_key("hotel-search", source, destination, depart, ret)
-        if key in keys:
+    for site, base_url, airline_hint in FLIGHT_PRICE_SITES:
+        if any(t.startswith(site) for t in existing):
             continue
-        url = build_search_url(base_url, query)
-        title = f"[{rank}] {source}｜{destination} 飯店酒店｜{depart}–{ret}"
-        props = {
-            "Deal Title": notion_title(title),
-            "Deal Type": notion_deal_type("Hotel"),
-            "Status": notion_status("Reviewing"),
-            "Destination": notion_text(destination),
-            "Country / Region": notion_text("Thailand"),
-            "Departure Date": notion_date(depart),
-            "Return Date": notion_date(ret),
-            "Nights": {"number": nights},
-            "Source": notion_select(source),
-            "URL": {"url": url},
-            "Keyword": notion_text(query),
-            "Summary": notion_text("待確認：住宿總價、每晚價格、區域、評分、早餐、取消政策與稅費。"),
-            "Fetched At": notion_now(),
-            "Duplicate Key": notion_text(key),
-            "Notified": {"checkbox": False},
-            "Notes": notion_text(f"平台：{source}。確認是否含稅費、含早餐、可免費取消、會員價與是否跳價。"),
+        title = f"{site}｜{info['origin']} → {info['destination']}｜{info['start']}–{info['end']}"
+        props: Dict[str, Any] = {
+            "網站名稱": notion_title(title),
+            "航空公司": notion_text(airline_hint),
+            "航班日期": {"date": {"start": info["start"], "end": info["end"] or None}},
+            "幣別": {"select": {"name": "TWD"}},
+            "查詢時間": {"date": {"start": now_iso}},
+            "訂票連結": {"url": build_search_url(base_url, query)},
+            "含回程託運行李": {"checkbox": False},
+            "備註": notion_text("結構列：等待查價後回填票價（統一 TWD），備註保留原始幣別、金額與換算依據。"),
         }
-        content = f"Search URL: {url}\nRequired fields: hotel name, area, room type, total price, price/night, rating, breakfast, cancellation, taxes/fees."
-        create_page(database_id, props, content)
-        keys.add(key)
+        create_db_row(price_db, props)
+        existing.add(title)
         created += 1
+    print(f"  Price sites: +{created} row(s).")
     return created
 
 
@@ -290,29 +263,26 @@ def main() -> int:
         print("Missing TRIP_DATABASE_ID", file=sys.stderr)
         return 2
 
-    requests = query_request_pages(database_id)
-    keys = existing_keys(database_id)
-    total_created = 0
-    processed = 0
+    journeys = query_all_pages(database_id)
+    print(f"Found {len(journeys)} journey task(s) in Trip database.")
+    total_flights = 0
+    total_sites = 0
 
-    for request in requests:
-        title = text_prop(request, "Deal Title")
-        key = text_prop(request, "Duplicate Key")
-        if not key or not ("trip-tw-cnx" in key or "清邁" in title or "Chiang Mai" in title):
+    for page in journeys:
+        info = parse_journey(page)
+        print(f"Journey: {info['title']}")
+        dbs = find_child_databases(page["id"])
+        flight_db = dbs.get("航班追蹤")
+        price_db = dbs.get("票價網站資料")
+        if not flight_db and not price_db:
+            print("  Skip: page has no 航班追蹤 / 票價網站資料 child database.")
             continue
-        created = 0
-        created += create_flight_platform_rows(database_id, request, keys)
-        created += create_hotel_platform_rows(database_id, request, keys)
-        total_created += created
-        update_page_status(
-            request["id"],
-            "Reviewing",
-            f"已建立平台搜尋列，共新增 {created} 筆候選搜尋資料。下一步：逐平台確認價格、班機時間與住宿條件。",
-        )
-        processed += 1
-        print(f"Processed request: {title}; created {created} row(s).")
+        if flight_db:
+            total_flights += rebuild_flight_rows(flight_db, info)
+        if price_db:
+            total_sites += rebuild_price_site_rows(price_db, info)
 
-    print(f"Processed {processed} request(s); created {total_created} platform row(s).")
+    print(f"Done. flights +{total_flights}, price sites +{total_sites}.")
     return 0
 
 
