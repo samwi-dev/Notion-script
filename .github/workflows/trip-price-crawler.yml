@@ -8,12 +8,11 @@ on:
 
 permissions:
   contents: read
-  models: read
 
 jobs:
   trip-price-crawler:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -30,9 +29,5 @@ jobs:
           TRIP_DATABASE_ID: ${{ secrets.TRIP_DATABASE_ID }}
         run: python crawlers/trip_price/crawler.py
 
-      - name: Step 2 — AI price lookup & backfill
-        env:
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          TRIP_DATABASE_ID: ${{ secrets.TRIP_DATABASE_ID }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python crawlers/trip_price/ai_price.py
+      # Step 2 票價查詢改由 Notion AI 手動執行，不在此自動化
+      # 使用方式：直接向 Notion AI 說「更新 XXX 的票價」即可
