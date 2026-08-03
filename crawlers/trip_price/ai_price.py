@@ -2,22 +2,23 @@
 # -*- coding: utf-8 -*-
 """ai_price.py - samwi-dev/Notion-script / crawlers/trip_price
 
-Flow:
-  1. Find rows in ticket_price_db where price is empty
-  2. DuckDuckGo HTML search (pure Python stdlib, no extra packages)
-  3. Regex extract price numbers, convert to TWD
-  4. Backfill price / note / query_time into Notion
+使用 Amadeus Flight Offers Search API 查詢真實票價
+https://developers.amadeus.com
 
 Required secrets:
   NOTION_TOKEN
   TRIP_DATABASE_ID
+  AMADEUS_API_KEY      <- 在 Amadeus 免費開發者帳號取得
+  AMADEUS_API_SECRET   <- 在 Amadeus 免費開發者帳號取得
+
+Amadeus 免費帳號申請：https://developers.amadeus.com/register
+每月 2000 次 API 呼叫免費
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import time
 import urllib.parse
@@ -28,17 +29,37 @@ from typing import Any, Dict, List, Optional, Tuple
 
 NOTION_VERSION = "2022-06-28"
 WRITE_DELAY_SEC = 0.4
-SEARCH_DELAY_SEC = 3.0
+AMADEUS_TOKEN_URL = "https://test.api.amadeus.com/v1/security/oauth2/token"
+AMADEUS_SEARCH_URL = "https://test.api.amadeus.com/v2/shopping/flight-offers"
 
-USD_TO_TWD = 32.4
-THB_TO_TWD = 0.9
+# IATA airport mapping for common Taiwan/Thailand airports
+AIRPORT_MAP = {
+    "台北": "TPE", "臺北": "TPE", "taipei": "TPE",
+    "清邁": "CNX", "chiang mai": "CNX",
+    "曼谷": "BKK", "bangkok": "BKK",
+    "東京": "TYO", "osaka": "KIX",
+}
+
+# Site name → airline IATA code (for filtering results)
+SITE_AIRLINE_MAP = {
+    "China Airlines": "CI",
+    "中華航空": "CI",
+    "EVA Air": "BR",
+    "長榮航空": "BR",
+    "STARLUX Airlines": "JX",
+    "星宇航空": "JX",
+    "Thai AirAsia": "FD",
+    "泰國亞洲航空": "FD",
+}
 
 
-# --- Notion helpers ---
+# ---------------------------------------------------------------------------
+# Notion helpers
+# ---------------------------------------------------------------------------
 
 def env(name: str) -> Optional[str]:
     v = os.environ.get(name)
-    return v if v else None
+    return v.strip() if v else None
 
 
 def notion_headers() -> Dict[str, str]:
@@ -52,15 +73,38 @@ def notion_headers() -> Dict[str, str]:
     }
 
 
-def http_json(method: str, url: str, payload: Optional[dict] = None) -> dict:
-    data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers=notion_headers())
+def http_request(
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    payload: Optional[dict | str] = None,
+    form_data: Optional[str] = None,
+) -> dict:
+    if form_data:
+        data = form_data.encode("utf-8")
+    elif payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+    else:
+        data = None
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=45) as res:
             return json.loads(res.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:400]
+        body = e.read().decode("utf-8", errors="replace")[:600]
         raise RuntimeError(f"{method} {url} -> HTTP {e.code}: {body}") from e
+
+
+def notion_get(path: str) -> dict:
+    return http_request("GET", f"https://api.notion.com/v1{path}", notion_headers())
+
+
+def notion_post(path: str, payload: dict) -> dict:
+    return http_request("POST", f"https://api.notion.com/v1{path}", notion_headers(), payload)
+
+
+def notion_patch(path: str, payload: dict) -> dict:
+    return http_request("PATCH", f"https://api.notion.com/v1{path}", notion_headers(), payload)
 
 
 def text_prop(page: dict, name: str) -> str:
@@ -70,9 +114,6 @@ def text_prop(page: dict, name: str) -> str:
         return "".join(t.get("plain_text", "") for t in prop.get("title", []))
     if typ == "rich_text":
         return "".join(t.get("plain_text", "") for t in prop.get("rich_text", []))
-    if typ == "number":
-        v = prop.get("number")
-        return str(v) if v is not None else ""
     return ""
 
 
@@ -83,11 +124,7 @@ def query_all_pages(database_id: str) -> List[dict]:
         payload: Dict[str, Any] = {"page_size": 100}
         if cursor:
             payload["start_cursor"] = cursor
-        data = http_json(
-            "POST",
-            f"https://api.notion.com/v1/databases/{database_id}/query",
-            payload,
-        )
+        data = notion_post(f"/databases/{database_id}/query", payload)
         pages.extend(data.get("results", []))
         if not data.get("has_more"):
             break
@@ -99,10 +136,10 @@ def list_block_children(block_id: str) -> List[dict]:
     blocks: List[dict] = []
     cursor = None
     while True:
-        url = f"https://api.notion.com/v1/blocks/{block_id}/children?page_size=100"
+        path = f"/blocks/{block_id}/children?page_size=100"
         if cursor:
-            url += "&start_cursor=" + urllib.parse.quote(cursor)
-        data = http_json("GET", url)
+            path += "&start_cursor=" + urllib.parse.quote(cursor)
+        data = notion_get(path)
         blocks.extend(data.get("results", []))
         if not data.get("has_more"):
             break
@@ -123,142 +160,257 @@ def find_child_databases(page_id: str) -> Dict[str, str]:
 
 
 def update_page_props(page_id: str, props: dict) -> None:
-    http_json(
-        "PATCH",
-        f"https://api.notion.com/v1/pages/{page_id}",
-        {"properties": props},
-    )
+    notion_patch(f"/pages/{page_id}", {"properties": props})
     time.sleep(WRITE_DELAY_SEC)
 
 
-# --- DuckDuckGo search (stdlib only) ---
+# ---------------------------------------------------------------------------
+# Amadeus helpers
+# ---------------------------------------------------------------------------
 
-def ddg_search(query: str, max_results: int = 8) -> str:
-    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query)
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-            "Accept-Language": "zh-TW,en;q=0.9",
-        },
-    )
+_amadeus_token: Optional[str] = None
+_amadeus_token_expiry: float = 0.0
+
+
+def get_amadeus_token() -> str:
+    global _amadeus_token, _amadeus_token_expiry
+    if _amadeus_token and time.time() < _amadeus_token_expiry:
+        return _amadeus_token
+
+    api_key = env("AMADEUS_API_KEY")
+    api_secret = env("AMADEUS_API_SECRET")
+    if not api_key or not api_secret:
+        raise RuntimeError(
+            "Missing AMADEUS_API_KEY or AMADEUS_API_SECRET.\n"
+            "Register free at: https://developers.amadeus.com/register"
+        )
+
+    form = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": api_key,
+        "client_secret": api_secret,
+    })
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    result = http_request("POST", AMADEUS_TOKEN_URL, headers, form_data=form)
+    _amadeus_token = result["access_token"]
+    _amadeus_token_expiry = time.time() + result.get("expires_in", 1799) - 60
+    return _amadeus_token
+
+
+def search_flights(
+    origin: str,
+    destination: str,
+    depart_date: str,
+    return_date: Optional[str] = None,
+    adults: int = 1,
+    airline_code: Optional[str] = None,
+    non_stop: bool = True,
+    currency: str = "TWD",
+) -> List[dict]:
+    """Search flight offers via Amadeus API."""
+    token = get_amadeus_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    params: Dict[str, Any] = {
+        "originLocationCode": origin,
+        "destinationLocationCode": destination,
+        "departureDate": depart_date,
+        "adults": adults,
+        "nonStop": str(non_stop).lower(),
+        "currencyCode": currency,
+        "max": 10,
+    }
+    if return_date:
+        params["returnDate"] = return_date
+    if airline_code:
+        params["includedAirlineCodes"] = airline_code
+
+    qs = urllib.parse.urlencode(params)
+    url = f"{AMADEUS_SEARCH_URL}?{qs}"
+    req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=30) as res:
-            html = res.read().decode("utf-8", errors="replace")
+        with urllib.request.urlopen(req, timeout=45) as res:
+            data = json.loads(res.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:600]
+        raise RuntimeError(f"Amadeus search -> HTTP {e.code}: {body}") from e
+
+    return data.get("data", [])
+
+
+def get_cheapest_price(
+    origin: str,
+    destination: str,
+    depart_date: str,
+    return_date: Optional[str],
+    airline_code: Optional[str] = None,
+    non_stop: bool = True,
+) -> Tuple[Optional[int], str]:
+    """Return (price_twd, note) for the cheapest matching offer."""
+    try:
+        offers = search_flights(
+            origin=origin,
+            destination=destination,
+            depart_date=depart_date,
+            return_date=return_date,
+            airline_code=airline_code,
+            non_stop=non_stop,
+        )
     except Exception as e:
-        return f"search failed: {e}"
-
-    snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.S)
-    titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', html, re.S)
-    tag_re = re.compile(r"<[^>]+>")
-
-    def clean(s: str) -> str:
-        return tag_re.sub("", s).strip()
-
-    parts = []
-    for i, (t, s) in enumerate(zip(titles, snippets)):
-        if i >= max_results:
-            break
-        parts.append(f"[{i+1}] {clean(t)} -- {clean(s)}")
-    return "\n".join(parts) if parts else "(no results)"
-
-
-# --- Price extraction via regex ---
-
-def extract_price_twd(text: str) -> Tuple[Optional[int], str]:
-    """Find the lowest plausible flight price in text, convert to TWD."""
-    candidates: List[Tuple[int, str, str]] = []  # (twd, original, currency)
-
-    # NT$ / TWD / NTD / Chinese
-    for m in re.finditer(
-        r"(?:NT\$|TWD|NTD|\u65b0\u53f0\u5e63|\u53f0\u5e63)[\s]*([\d,]+)", text
-    ):
-        val = int(m.group(1).replace(",", ""))
-        if 3000 <= val <= 200000:
-            candidates.append((val, m.group(0), "TWD"))
-
-    # THB
-    for m in re.finditer(
-        r"(?:THB|\u6cf0\u9296|\u0e3f)[\s]*([\d,]+)", text
-    ):
-        val = int(m.group(1).replace(",", ""))
-        twd = int(val * THB_TO_TWD)
-        if 3000 <= twd <= 200000:
-            candidates.append(
-                (twd, f"{m.group(0)} (~TWD {twd:,}, rate 1 THB=0.9 TWD)", "THB")
-            )
-
-    # USD / US$
-    for m in re.finditer(r"(?:USD|US\$|\$)[\s]*([\d,]+(?:\.\d+)?)", text):
-        try:
-            val = float(m.group(1).replace(",", ""))
-        except ValueError:
-            continue
-        twd = int(val * USD_TO_TWD)
-        if 3000 <= twd <= 200000:
-            candidates.append(
-                (twd, f"{m.group(0)} (~TWD {twd:,}, rate 1 USD=32.4 TWD)", "USD")
-            )
-
-    # Bare numbers near price keywords
-    price_kw = re.compile(
-        r"(?:price|fare|\u7968\u50f9|\u6a5f\u7968|\u8cbb\u7528|\u8d77|from|\u5143|\u5e63)",
-        re.IGNORECASE,
-    )
-    for m in re.finditer(r"\b([1-9]\d{3,5})\b", text):
-        val = int(m.group(1))
-        if 3000 <= val <= 80000:
-            start = max(0, m.start() - 80)
-            end = min(len(text), m.end() + 80)
-            if price_kw.search(text[start:end]):
-                candidates.append(
-                    (val, f"{val} (inferred TWD from context)", "TWD-inferred")
+        # If airline-specific filter found nothing, try without filter
+        if airline_code:
+            print(f"      airline filter failed ({e}), retrying without filter")
+            try:
+                offers = search_flights(
+                    origin=origin,
+                    destination=destination,
+                    depart_date=depart_date,
+                    return_date=return_date,
+                    non_stop=non_stop,
                 )
+            except Exception as e2:
+                return None, f"Amadeus error: {e2}"
+        else:
+            return None, f"Amadeus error: {e}"
 
-    if not candidates:
-        return None, "regex: no price found in search snippets"
+    if not offers:
+        # Retry with non_stop=False if nothing found
+        if non_stop:
+            try:
+                offers = search_flights(
+                    origin=origin,
+                    destination=destination,
+                    depart_date=depart_date,
+                    return_date=return_date,
+                    airline_code=airline_code,
+                    non_stop=False,
+                )
+            except Exception as e:
+                return None, f"Amadeus error (no non-stop fallback): {e}"
 
-    candidates.sort(key=lambda x: x[0])
-    best = candidates[0]
-    return best[0], f"\u539f\u59cb\u5831\u50f9: {best[1]} | \u5e63\u5225: {best[2]}"
+    if not offers:
+        return None, "Amadeus: 查無航班，請確認日期或航線是否有直飛班次"
+
+    # Find cheapest
+    best_offer = None
+    best_price = float("inf")
+    for offer in offers:
+        try:
+            price_str = offer["price"]["grandTotal"]
+            price = float(price_str)
+            if price < best_price:
+                best_price = price
+                best_offer = offer
+        except (KeyError, ValueError):
+            continue
+
+    if best_offer is None:
+        return None, "Amadeus: 無法解析票價"
+
+    price_twd = int(best_price)
+    currency = best_offer["price"].get("currency", "TWD")
+
+    # Extract airline info from first itinerary
+    airlines_str = ""
+    try:
+        segments = best_offer["itineraries"][0]["segments"]
+        codes = list(dict.fromkeys(s["carrierCode"] for s in segments))
+        airlines_str = "+".join(codes)
+    except (KeyError, IndexError):
+        pass
+
+    trip_type = "來回" if return_date else "單程"
+    note = (
+        f"Amadeus API | {trip_type} | 幣別: {currency} | "
+        f"最低票價: {currency} {best_price:,.0f} | 航空: {airlines_str}"
+    )
+    return price_twd, note
 
 
-# --- Core logic ---
+# ---------------------------------------------------------------------------
+# Journey parsing helpers
+# ---------------------------------------------------------------------------
 
-def process_price_db(price_db_id: str, journey_info: Dict[str, str]) -> int:
+def parse_iata(city_name: str) -> Optional[str]:
+    """Try to resolve a city name to IATA code."""
+    lower = city_name.lower().strip()
+    for key, code in AIRPORT_MAP.items():
+        if key in lower or lower in key:
+            return code
+    # If already looks like IATA (3 uppercase letters)
+    if city_name.strip().isupper() and len(city_name.strip()) == 3:
+        return city_name.strip()
+    return None
+
+
+def parse_airline_from_site(site_name: str) -> Optional[str]:
+    """Extract airline IATA code from site title (for airline official sites)."""
+    for keyword, code in SITE_AIRLINE_MAP.items():
+        if keyword.lower() in site_name.lower():
+            return code
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Core logic
+# ---------------------------------------------------------------------------
+
+def process_price_db(
+    price_db_id: str,
+    journey_info: Dict[str, str],
+) -> int:
     rows = query_all_pages(price_db_id)
     updated = 0
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    origin_iata = parse_iata(journey_info.get("origin_city", "")) or "TPE"
+    dest_iata = parse_iata(journey_info.get("dest_city", "")) or "CNX"
+    depart_date = journey_info.get("start", "")[:10]  # YYYY-MM-DD
+    return_date = journey_info.get("end", "")[:10] or None
+
+    if not depart_date:
+        print("  Skip: no departure date found")
+        return 0
+
+    print(f"  Route: {origin_iata} → {dest_iata} | {depart_date} – {return_date}")
+
     for row in rows:
-        # Skip rows that already have a price
-        price_val = row.get("properties", {}).get("\u7968\u50f9", {}).get("number")
+        # Skip rows that already have a valid price
+        price_val = row.get("properties", {}).get("票價", {}).get("number")
         if price_val is not None:
+            site_title = text_prop(row, "網站名稱")
+            print(f"    [{site_title[:30]}] skip (already has price {price_val})")
             continue
 
-        site_title = text_prop(row, "\u7db2\u7ad9\u540d\u7a31")
-        site_name = (
-            site_title.split("\uff5c")[0].strip() if "\uff5c" in site_title else site_title
-        )
+        site_title = text_prop(row, "網站名稱")
+        # Extract just the site/airline name (before ｜)
+        site_name = site_title.split("｜")[0].strip() if "｜" in site_title else site_title
 
-        query = (
-            f"{site_name} "
-            f"{journey_info['origin_city']} {journey_info['dest_city']} "
-            f"\u6a5f\u7968 {journey_info['start']} \u76f4\u98db \u542b\u6258\u904b\u884c\u674e \u50f9\u683c"
-        )
-        print(f"    [{site_name}] searching...")
-        snippets = ddg_search(query)
-        time.sleep(SEARCH_DELAY_SEC)
+        # For airline official sites, filter by that airline
+        airline_code = parse_airline_from_site(site_name)
+        is_direct = True  # 行程要求直飛
 
-        price_twd, note = extract_price_twd(snippets)
+        print(f"    [{site_name}] querying Amadeus (airline={airline_code or 'any'})...")
+        price_twd, note = get_cheapest_price(
+            origin=origin_iata,
+            destination=dest_iata,
+            depart_date=depart_date,
+            return_date=return_date,
+            airline_code=airline_code,
+            non_stop=is_direct,
+        )
+        time.sleep(0.5)  # rate limit
 
         props: Dict[str, Any] = {
-            "\u67e5\u8a62\u6642\u9593": {"date": {"start": now_iso}},
-            "\u5099\u8a3b": {"rich_text": [{"text": {"content": note[:2000]}}]},
+            "查詢時間": {"date": {"start": now_iso}},
+            "備註": {"rich_text": [{"text": {"content": note[:2000]}}]},
         }
         if price_twd is not None:
-            props["\u7968\u50f9"] = {"number": price_twd}
-            props["\u5e63\u5225"] = {"select": {"name": "TWD"}}
+            props["票價"] = {"number": price_twd}
+            props["幣別"] = {"select": {"name": "TWD"}}
             print(f"      -> TWD {price_twd:,}")
         else:
             print(f"      -> no price ({note})")
@@ -268,7 +420,7 @@ def process_price_db(price_db_id: str, journey_info: Dict[str, str]) -> int:
             update_page_props(page_id, props)
             updated += 1
         except Exception as e:
-            print(f"      WARNING backfill failed: {e}")
+            print(f"      WARNING: Notion update failed: {e}")
 
     return updated
 
@@ -277,6 +429,15 @@ def main() -> int:
     database_id = env("TRIP_DATABASE_ID") or env("NOTION_DATABASE_ID")
     if not database_id:
         print("Missing TRIP_DATABASE_ID", file=sys.stderr)
+        return 2
+
+    # Quick Amadeus token test
+    print("Testing Amadeus credentials...")
+    try:
+        token = get_amadeus_token()
+        print(f"Amadeus token OK (length={len(token)})")
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
     journeys = query_all_pages(database_id)
@@ -297,11 +458,10 @@ def main() -> int:
         start = trip_date.get("start") or ""
         end = trip_date.get("end") or ""
 
-        # Parse city names for search queries
-        origin_city = "\u53f0\u5317"
-        dest_city = "\u6e05\u9081"
-        if "\u2192" in from_to:
-            left, right = from_to.split("\u2192", 1)
+        origin_city = "台北"
+        dest_city = "清邁"
+        if "→" in from_to:
+            left, right = from_to.split("→", 1)
             origin_city = left.strip()
             dest_city = right.strip()
 
@@ -313,18 +473,18 @@ def main() -> int:
             "end": end,
         }
 
-        print(f"Journey: {title}")
+        print(f"\nJourney: {title}")
         dbs = find_child_databases(page["id"])
-        price_db = dbs.get("\u7968\u50f9\u7db2\u7ad9\u8cc7\u6599")
+        price_db = dbs.get("票價網站資料")
         if not price_db:
-            print("  Skip: no child database named \u7968\u50f9\u7db2\u7ad9\u8cc7\u6599")
+            print("  Skip: no child database named 票價網站資料")
             continue
 
         count = process_price_db(price_db, info)
         print(f"  Updated {count} row(s).")
         total_updated += count
 
-    print(f"Done. Total updated: {total_updated}.")
+    print(f"\nDone. Total updated: {total_updated}.")
     return 0
 
 
