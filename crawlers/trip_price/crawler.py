@@ -9,6 +9,8 @@
   - 「航班追蹤」：本旅程航班（page icon 使用航空公司官網 favicon）
 - 爬蟲負責「重建結構」：補齊航班追蹤的直飛航空公司、票價網站資料的各網站報價列
 - 去重：航班追蹤以「航空公司」title、票價網站資料以「網站名稱」前綴判斷，可每日重複執行
+- 訂票連結：使用各平台真正的深度連結格式（帶航線與日期參數，點開直接顯示搜尋結果）；
+  航空公司官網不支援帶日期深度連結，連到訂票頁
 - 實際價格由比價流程查詢後回填（統一 TWD，備註保留原始幣別與換算依據）
 
 Required GitHub Actions secrets:
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -192,9 +195,78 @@ def favicon_icon(domain: str) -> dict:
     return {"type": "external", "external": {"url": f"https://www.google.com/s2/favicons?domain={domain}&sz=128"}}
 
 
-def build_search_url(base: str, query: str) -> str:
-    sep = "&" if "?" in base else "?"
-    return base + sep + "q=" + urllib.parse.quote(query)
+def _parse_iso_date(value: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime((value or "")[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def extract_airport_code(text: str) -> str:
+    """從 '台灣 TPE/TSA' 這類字串取出第一個 IATA 三碼。"""
+    match = re.search(r"\b([A-Z]{3})\b", text or "")
+    return match.group(1) if match else ""
+
+
+def build_booking_url(site: str, base_url: str, dep: str, arr: str, start: str, end: str) -> str:
+    """產生各平台可直接顯示搜尋結果的深度連結。
+
+    重要：不可使用「首頁 + ?q=搜尋字串」假參數，各網站不認得這種格式，
+    點開後不會出現任何搜尋結果。缺日期或機場代碼時退回官網首頁。
+    """
+    d1, d2 = _parse_iso_date(start), _parse_iso_date(end)
+    if not (dep and arr and d1 and d2):
+        return base_url
+    iso1, iso2 = d1.strftime("%Y-%m-%d"), d2.strftime("%Y-%m-%d")
+    if site == "Google Flights":
+        q = f"Flights from {dep} to {arr} on {iso1} through {iso2}"
+        return "https://www.google.com/travel/flights?q=" + urllib.parse.quote(q)
+    if site == "Skyscanner":
+        return (
+            f"https://www.skyscanner.com.tw/transport/flights/"
+            f"{dep.lower()}/{arr.lower()}/{d1.strftime('%y%m%d')}/{d2.strftime('%y%m%d')}/"
+        )
+    if site == "Trip.com":
+        return (
+            f"https://tw.trip.com/flights/showfarefirst?dcity={dep.lower()}&acity={arr.lower()}"
+            f"&ddate={iso1}&rdate={iso2}&triptype=rt&class=y&quantity=1"
+        )
+    if site == "KAYAK":
+        return f"https://www.kayak.com.tw/flights/{dep}-{arr}/{iso1}/{iso2}?sort=bestflight_a"
+    if site == "Expedia":
+        us1, us2 = d1.strftime("%m/%d/%Y"), d2.strftime("%m/%d/%Y")
+        return (
+            "https://www.expedia.com.tw/Flights-Search?trip=roundtrip"
+            f"&leg1=from:{dep},to:{arr},departure:{us1}TANYT"
+            f"&leg2=from:{arr},to:{dep},departure:{us2}TANYT"
+            "&passengers=adults:1&mode=search"
+        )
+    if site == "momondo":
+        return f"https://www.momondo.tw/flight-search/{dep}-{arr}/{iso1}/{iso2}?sort=bestflight_a"
+    if site == "Booking.com":
+        return (
+            f"https://flights.booking.com/flights/{dep}.AIRPORT-{arr}.AIRPORT/"
+            f"?type=ROUNDTRIP&adults=1&cabinClass=ECONOMY&depart={iso1}&return={iso2}"
+        )
+    if site == "ezTravel 易遊網":
+        return (
+            f"https://flight.eztravel.com.tw/tickets-roundtrip-{dep.lower()}-{arr.lower()}"
+            f"?outbounddate={d1.strftime('%Y/%m/%d')}&inbounddate={d2.strftime('%Y/%m/%d')}"
+        )
+    if site == "Thai AirAsia 泰國亞洲航空":
+        return (
+            f"https://www.airasia.com/flights/search/?origin={dep}&destination={arr}"
+            f"&departDate={d1.strftime('%d/%m/%Y')}&returnDate={d2.strftime('%d/%m/%Y')}"
+            "&tripType=R&adult=1&locale=zh-tw&currency=TWD"
+        )
+    # 航空公司官網不支援帶日期的深度連結，連到訂票頁（需手動輸入日期）
+    if site == "EVA Air 長榮航空":
+        return "https://www.evaair.com/zh-tw/booking/book-flights/"
+    if site == "China Airlines 中華航空":
+        return "https://www.china-airlines.com/tw/zh/booking/book-flights"
+    if site == "STARLUX Airlines 星宇航空":
+        return "https://www.starlux-airlines.com/zh-TW/booking/flights"
+    return base_url
 
 
 def airlines_for_route(info: Dict[str, str]) -> List[tuple]:
@@ -233,20 +305,22 @@ def rebuild_price_site_rows(price_db: str, info: Dict[str, str]) -> int:
         print(f"  Skip price sites: journey '{info['title']}' has no Trip Date.")
         return 0
     existing = existing_titles(price_db, "網站名稱")
-    query = f"{info['origin']} to {info['destination']} direct flight {info['start']} {info['end']} return checked baggage"
+    dep_code = extract_airport_code(info["origin"]) or "TPE"
+    arr_code = extract_airport_code(info["destination"])
     now_iso = datetime.now(timezone.utc).isoformat()
     created = 0
     for site, base_url, airline_hint in FLIGHT_PRICE_SITES:
         if any(t.startswith(site) for t in existing):
             continue
         title = f"{site}｜{info['origin']} → {info['destination']}｜{info['start']}–{info['end']}"
+        booking_url = build_booking_url(site, base_url, dep_code, arr_code, info["start"], info["end"])
         props: Dict[str, Any] = {
             "網站名稱": notion_title(title),
             "航空公司": notion_text(airline_hint),
             "航班日期": {"date": {"start": info["start"], "end": info["end"] or None}},
             "幣別": {"select": {"name": "TWD"}},
             "查詢時間": {"date": {"start": now_iso}},
-            "訂票連結": {"url": build_search_url(base_url, query)},
+            "訂票連結": {"url": booking_url},
             "含回程託運行李": {"checkbox": False},
             "備註": notion_text("結構列：等待查價後回填票價（統一 TWD），備註保留原始幣別、金額與換算依據。"),
         }
