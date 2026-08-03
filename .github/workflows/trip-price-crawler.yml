@@ -8,11 +8,12 @@ on:
 
 permissions:
   contents: read
+  models: read
 
 jobs:
   trip-price-crawler:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -23,8 +24,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run Trip price crawler
+      - name: Step 1 — Rebuild structure rows (flights + price sites)
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           TRIP_DATABASE_ID: ${{ secrets.TRIP_DATABASE_ID }}
         run: python crawlers/trip_price/crawler.py
+
+      - name: Step 2 — AI price lookup & backfill
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          TRIP_DATABASE_ID: ${{ secrets.TRIP_DATABASE_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python crawlers/trip_price/ai_price.py
