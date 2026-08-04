@@ -5,13 +5,17 @@
 2026-08 重寫版，對齊目前 Notion 架構：
 - TRIP_DATABASE_ID 指向 Trip database；每一列 = 一個 Journey Task（一個旅程只保留一個 Task）
 - 每個 Journey Task 頁面內嵌兩個子 database：
-  - 「 票價網站資料」：各比價網站報價（linked view「整月價格走勢」chart 的資料來源）
+  - 「票價網站資料」：各比價網站報價（linked view「整月價格走勢」chart 的資料來源）
   - 「航班追蹤」：本旅程航班（page icon 使用航空公司官網 favicon）
 - 爬蟲負責「重建結構」：補齊航班追蹤的直飛航空公司、票價網站資料的各網站報價列
 - 去重：航班追蹤以「航空公司」title、票價網站資料以「網站名稱」前綴判斷，可每日重複執行
 - 訂票連結：使用各平台真正的深度連結格式（帶航線與日期參數，點開直接顯示搜尋結果）；
   航空公司官網不支援帶日期深度連結，連到訂票頁
 - 實際價格由比價流程查詢後回填（統一 TWD，備註保留原始幣別與換算依據）
+
+2026-08-04 觸發機制精簡：不再另外寫「GitHub Actions 執行日誌」資料庫來觸發 Notion AI Agent。
+改為執行 `--touch-trigger` 時，直接更新「航班追蹤」子 database 中第一列的「上次觸發時間」
+屬性；Notion 端 Agent 監看該屬性變更即會自動觸發，省去一層日誌資料庫與一次額外的頁面建立。
 
 Required GitHub Actions secrets:
 - NOTION_TOKEN
@@ -259,7 +263,6 @@ def build_booking_url(site: str, base_url: str, dep: str, arr: str, start: str, 
             f"&departDate={d1.strftime('%d/%m/%Y')}&returnDate={d2.strftime('%d/%m/%Y')}"
             "&tripType=R&adult=1&locale=zh-tw&currency=TWD"
         )
-    # 航空公司官網不支援帶日期的深度連結，連到訂票頁（需手動輸入日期）
     if site == "EVA Air 長榮航空":
         return "https://www.evaair.com/zh-tw/booking/book-flights/"
     if site == "China Airlines 中華航空":
@@ -331,11 +334,43 @@ def rebuild_price_site_rows(price_db: str, info: Dict[str, str]) -> int:
     return created
 
 
+def touch_trigger_property(database_id: str) -> bool:
+    """更新第一個找到的 Journey Task 之「航班追蹤」子 database 中任一列的
+    「上次觸發時間」屬性，藉此觸發 Notion 端監看該屬性變更的 Agent 開始查價。
+
+    取代舊的「在 GitHub Actions 執行日誌 database 新增一列」機制：
+    不用另外建立日誌資料庫，也不用多一次頁面建立 API 呼叫。
+    """
+    journeys = query_all_pages(database_id)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for page in journeys:
+        dbs = find_child_databases(page["id"])
+        flight_db = dbs.get("航班追蹤")
+        if not flight_db:
+            continue
+        rows = query_all_pages(flight_db)
+        if not rows:
+            continue
+        target_id = rows[0]["id"]
+        http_json(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{target_id}",
+            {"properties": {"上次觸發時間": {"date": {"start": now_iso}}}},
+        )
+        print(f"Touched trigger property on flight row {target_id} (journey page {page['id']}).")
+        return True
+    print("No journey with a 航班追蹤 child database found; nothing to touch.", file=sys.stderr)
+    return False
+
+
 def main() -> int:
     database_id = env("TRIP_DATABASE_ID") or env("NOTION_DATABASE_ID")
     if not database_id:
         print("Missing TRIP_DATABASE_ID", file=sys.stderr)
         return 2
+
+    if "--touch-trigger" in sys.argv[1:]:
+        return 0 if touch_trigger_property(database_id) else 1
 
     journeys = query_all_pages(database_id)
     print(f"Found {len(journeys)} journey task(s) in Trip database.")
