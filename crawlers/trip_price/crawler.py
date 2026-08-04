@@ -36,6 +36,14 @@ Thai AirAsia 的訂票深度連結）。已全部改用字串連接（+）重寫
 異體字「廦」），先前程式碼誤寫為「航廈位置」，實際呼叫 Notion API 會因屬性不存在而失敗。
 已改為與資料庫 schema 完全一致的「航廦位置」。
 
+2026-08-04 新增第 13、14 個票價平台：Kiwi.com（虛擬轉機組合，常能拼出比其他平台更低的
+組合價；深度連結格式 https://www.kiwi.com/deep?from=&to=&departure=&return= 已於
+Travelpayouts 官方文件證實可用）、Traveloka（東南亞 OTA，區域航線與廉航票價常見更低，但
+官網沒有可證實的公開日期深度連結格式，因此只連到機票搜尋頁 base_url，訂票連結／備註需標明
+手動輸入航線與日期，避免重演雙括號轉義那類「連結格式猜錯」的問題）。兩者皆與 Google Flights
+等既有 5 個動態比價網站一樣，回填的票價只是 web search 當下的路線層級參考值，備註仍需以
+「⚠️ 動態即時比價網站」開頭加註提醒。
+
 Required GitHub Actions secrets:
 - NOTION_TOKEN
 - TRIP_DATABASE_ID
@@ -70,6 +78,8 @@ FLIGHT_PRICE_SITES = [
     ("China Airlines 中華航空", "https://www.china-airlines.com", "China Airlines 中華航空"),
     ("STARLUX Airlines 星宇航空", "https://www.starlux-airlines.com", "STARLUX Airlines 星宇航空"),
     ("Thai AirAsia 泰國亞洲航空", "https://www.airasia.com", "Thai AirAsia 泰國亞洲航空"),
+    ("Kiwi.com", "https://www.kiwi.com", "多家航空公司比價／虛擬轉機組合，常見更低組合價"),
+    ("Traveloka", "https://www.traveloka.com/en-en/flight", "東南亞航線與廉航比價"),
 ]
 
 COUNTRY_AIRLINES: Dict[str, List[Tuple[str, str, str]]] = {
@@ -294,6 +304,16 @@ def build_booking_url(site: str, base_url: str, dep: str, arr: str, start: str, 
             + "&departDate=" + d1.strftime("%d/%m/%Y") + "&returnDate=" + d2.strftime("%d/%m/%Y")
             + "&tripType=R&adult=1&locale=zh-tw&currency=TWD"
         )
+    if site == "Kiwi.com":
+        # 官方 affiliate 文件證實的深度連結格式：/deep?from=&to=&departure=&return=（IATA 三字碼、YYYY-MM-DD）
+        return (
+            "https://www.kiwi.com/deep?from=" + dep + "&to=" + arr
+            + "&departure=" + iso1 + "&return=" + iso2
+        )
+    if site == "Traveloka":
+        # Traveloka 官網沒有可證實的公開日期深度連結格式；為避免重演雙括號轉義那類
+        # 「連結格式猜錯」問題，一律回傳機票搜尋頁 base_url，備註標明需手動輸入航線與日期。
+        return base_url
     if site == "EVA Air 長槮航空":
         return "https://www.evaair.com/zh-tw/booking/book-flights/"
     if site == "China Airlines 中華航空":
