@@ -30,43 +30,24 @@ jobs:
           TRIP_DATABASE_ID: ${{ secrets.TRIP_DATABASE_ID }}
         run: python crawlers/trip_price/crawler.py
 
-      # Step 2 — 觸發 Notion AI 抓票價（會用到 Notion AI credit）
+      # Step 2 — 觸發 Notion AI Agent 查價（會用到 Notion AI credit）
+      # 2026-08-04 起改為直接更新「航班追蹤」子 database 的「上次觸發時間」屬性，
+      # 不再另外寫「GitHub Actions 執行日誌」資料庫；Notion 端 Agent 監看該屬性變更即會自動觸發。
       # 為節省 credit，只在以下情況執行：
       #   1. 每週一（自動，每週只用 1 次 credit）
       #   2. 手動 Run workflow（想更新票價時隨時可觸發）
-      - name: Step 2 — Notify Notion AI Agent (weekly or manual only)
+      - name: Step 2 — Touch trigger property (weekly or manual only)
         if: always()
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_PRICE_LOG_DB_ID: ${{ secrets.NOTION_PRICE_LOG_DB_ID }}
+          TRIP_DATABASE_ID: ${{ secrets.TRIP_DATABASE_ID }}
         run: |
-          # 只在週一或手動觸發時執行，其餘日子直接跳過（省 credit）
+          if [ "${{ steps.step1.outcome }}" != "success" ]; then
+            echo "Step 1 失敗，略過觸發，請檢查 GitHub Actions 記錄"
+            exit 0
+          fi
           if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ "$(date -u +%u)" != "1" ]; then
             echo "Skip: 節省 Notion AI credit，只在週一或手動觸發時通知 Agent"
             exit 0
           fi
-          STATUS="✅ 成功"
-          NOTE="Step 1 完成，觸發 Notion AI 抓取票價"
-          if [ "${{ steps.step1.outcome }}" != "success" ]; then
-            STATUS="❌ 失敗"
-            NOTE="Step 1 失敗，請檢查 GitHub Actions 記錄"
-          fi
-          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          curl -s -X POST https://api.notion.com/v1/pages \
-            -H "Authorization: Bearer ${NOTION_TOKEN}" \
-            -H "Notion-Version: 2022-06-28" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"parent\": { \"database_id\": \"${NOTION_PRICE_LOG_DB_ID}\" },
-              \"properties\": {
-                \"\u57f7\u884c\u6642\u9593\": {
-                  \"title\": [{ \"text\": { \"content\": \"${NOW}\" } }]
-                },
-                \"\u72c0\u614b\": {
-                  \"select\": { \"name\": \"${STATUS}\" }
-                },
-                \"\u5099\u8a3b\": {
-                  \"rich_text\": [{ \"text\": { \"content\": \"${NOTE}\" } }]
-                }
-              }
-            }"
+          python crawlers/trip_price/crawler.py --touch-trigger
