@@ -11,7 +11,7 @@
 - 去重：航班追蹤以「航空公司」title、票價網站資料以「網站名稱」前綴判斷，可每日重複執行
 - 訂票連結：使用各平台真正的深度連結格式（帶航線與日期參數，點開直接顯示搜尋結果）；
   航空公司官網不支援帶日期深度連結，連到訂票頁
-- 實际價格由比價流程查詢後回填（統一 TWD，備註保留原始幣別與換算依據）
+- 實際價格由比價流程查詢後回填（統一 TWD，備註保留原始幣別與換算依據）
 
 2026-08-04 觸發機制精簡：不再別外寫「GitHub Actions 執行日誌」資料庫來觸發 Notion AI Agent。
 改為執行 `--touch-trigger` 時，直接更新「航班追蹤」子 database 中第一列的「上次觸發時間」
@@ -43,6 +43,12 @@ Travelpayouts 官方文件證實可用）、Traveloka（東南亞 OTA，區域�
 手動輸入航線與日期，避免重演雙括號轉義那類「連結格式猜錯」的問題）。兩者皆與 Google Flights
 等既有 5 個動態比價網站一樣，回填的票價只是 web search 當下的路線層級參考值，備註仍需以
 「⚠️ 動態即時比價網站」開頭加註提醒。
+
+2026-08-04 新增第 15 個票價平台：Airpaz（印尼發跡的東南亞 OTA，區域廉航票價常見更低，支援
+在地幣別與語言介面）。官網機票搜尋頁同樣沒有可證實的帶日期參數深度連結格式（已實际搜尋確認，
+只找到静態的 /en/flight 搜尋首頁），因此跟 Traveloka 同樣一律回傳 base_url，備註標明需手動輸入航線
+與日期，避免重演「連結格式猜錯」問題。同樣視為動態即時比價網站，備註需以「⚠️ 動態即時比價
+網站」開頭。
 
 Required GitHub Actions secrets:
 - NOTION_TOKEN
@@ -80,6 +86,7 @@ FLIGHT_PRICE_SITES = [
     ("Thai AirAsia 泰國亞洲航空", "https://www.airasia.com", "Thai AirAsia 泰國亞洲航空"),
     ("Kiwi.com", "https://www.kiwi.com", "多家航空公司比價／虛擬轉機組合，常見更低組合價"),
     ("Traveloka", "https://www.traveloka.com/en-en/flight", "東南亞航線與廉航比價"),
+    ("Airpaz", "https://www.airpaz.com/en/flight", "印尼發跡東南亞 OTA，區域廉航比價"),
 ]
 
 COUNTRY_AIRLINES: Dict[str, List[Tuple[str, str, str]]] = {
@@ -313,6 +320,10 @@ def build_booking_url(site: str, base_url: str, dep: str, arr: str, start: str, 
     if site == "Traveloka":
         # Traveloka 官網沒有可證實的公開日期深度連結格式；為避免重演雙括號轉義那類
         # 「連結格式猜錯」問題，一律回傳機票搜尋頁 base_url，備註標明需手動輸入航線與日期。
+        return base_url
+    if site == "Airpaz":
+        # Airpaz 官網機票搜尋頁同樣沒有可證實的帶日期深度連結格式，一律回傳
+        # 機票搜尋首頁 base_url，備註標明需手動輸入航線與日期。
         return base_url
     if site == "EVA Air 長槮航空":
         return "https://www.evaair.com/zh-tw/booking/book-flights/"
