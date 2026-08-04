@@ -27,9 +27,10 @@
 查價／核實航班資訊時回填。「相關比價紀錄」「相關網站報價」「相關航班」等 relation 欄位維持
 不由爬蟲自動填寫（比價紀錄列尚未建立、且分工文件已註明三者雙向 relation 不自動同步）。
 
-2026-08-04 修復這次提交中發現的舊 bug：部分產生 URL 的 f-string 誤用 `{{`/`}}` 雙括號轉義，
-導致實際產生的網址包含字面上的 `{` `}` 字元（包括 Notion API 內部呼叫與 Trip.com、KAYAK、
-momondo、Booking.com、ezTravel、Thai AirAsia 的訂票深度連結）。已全部改回正常單括號內插。
+2026-08-04 修復舊 bug：部分產生 URL 的 f-string 誤用雙括號轉義，導致實際網址包含字面上的
+大括號字元（包括 Notion API 內部呼叫與 Trip.com、KAYAK、momondo、Booking.com、ezTravel、
+Thai AirAsia 的訂票深度連結）。已全部改用字串連接（+）重寫，不再使用容易誤寫的
+雙括號 f-string 轉義。
 
 Required GitHub Actions secrets:
 - NOTION_TOKEN
@@ -67,10 +68,6 @@ FLIGHT_PRICE_SITES = [
     ("Thai AirAsia 泰國亞洲航空", "https://www.airasia.com", "Thai AirAsia 泰國亞洲航空"),
 ]
 
-# 航班追蹤的航空公司對應：以 Trip database 的 `Nation`（目的地國家）屬性為 key。
-# 只放「該國家常見、大概率會直飛或轉機服務該航線」的參考組合；
-# 實际是否直飛、正確航班時間與價格仍由 Notion AI 查價流程核實並回填。
-# 找不到對應國家時一律退回 DEFAULT_AIRLINES，不再讓非泰國旅程整組被跳過。
 COUNTRY_AIRLINES: Dict[str, List[Tuple[str, str, str]]] = {
     "Thailand": [
         ("EVA Air 長槮航空", "www.evaair.com", "BR"),
@@ -86,7 +83,6 @@ COUNTRY_AIRLINES: Dict[str, List[Tuple[str, str, str]]] = {
     ],
 }
 
-# 找不到 Nation 對應表時的預設組合：台灣飛國际線最常見的全服務／新興業者。
 DEFAULT_AIRLINES: List[Tuple[str, str, str]] = [
     ("EVA Air 長槮航空", "www.evaair.com", "BR"),
     ("China Airlines 中華航空", "www.china-airlines.com", "CI"),
@@ -104,7 +100,7 @@ def notion_headers() -> Dict[str, str]:
     if not token:
         raise RuntimeError("Missing NOTION_TOKEN")
     return {
-        "Authorization": f"Bearer {token}",
+        "Authorization": "Bearer " + token,
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
@@ -118,7 +114,7 @@ def http_json(method: str, url: str, payload: Optional[dict] = None) -> dict:
             return json.loads(res.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Notion API {method} {url} -> HTTP {e.code}: {body}") from e
+        raise RuntimeError("Notion API " + method + " " + url + " -> HTTP " + str(e.code) + ": " + body) from e
 
 
 def text_prop(page: dict, name: str) -> str:
@@ -175,7 +171,6 @@ def list_block_children(block_id: str) -> List[dict]:
 
 
 def find_child_databases(page_id: str) -> Dict[str, str]:
-    """回傳 {title: database_id}。只收頁面內孌的子 database，排除 linked view（標題為 'View of ...'）。"""
     found: Dict[str, str] = {}
     for block in list_block_children(page_id):
         if block.get("type") != "child_database":
@@ -244,60 +239,55 @@ def _parse_iso_date(value: str) -> Optional[datetime]:
 
 
 def extract_airport_code(text: str) -> str:
-    """從 '台灣 TPE/TSA' 這類字串取出第一個 IATA 三碼。"""
     match = re.search(r"\b([A-Z]{3})\b", text or "")
     return match.group(1) if match else ""
 
 
 def build_booking_url(site: str, base_url: str, dep: str, arr: str, start: str, end: str) -> str:
-    """產生各平台可直接顯示搜尋結果的深度連結。
-
-    重要：不可使用「首頁 + ?q=搜尋字串」假參數，各網站不認得這種格式，
-    點開後不會出現任何搜尋結果。缺日期或機場代碼時退回官網首頁。
-    """
     d1, d2 = _parse_iso_date(start), _parse_iso_date(end)
     if not (dep and arr and d1 and d2):
         return base_url
     iso1, iso2 = d1.strftime("%Y-%m-%d"), d2.strftime("%Y-%m-%d")
+    dep_lower, arr_lower = dep.lower(), arr.lower()
     if site == "Google Flights":
-        q = f"Flights from {dep} to {arr} on {iso1} through {iso2}"
+        q = "Flights from " + dep + " to " + arr + " on " + iso1 + " through " + iso2
         return "https://www.google.com/travel/flights?q=" + urllib.parse.quote(q)
     if site == "Skyscanner":
         return (
             "https://www.skyscanner.com.tw/transport/flights/"
-            + f"{dep.lower()}/{arr.lower()}/{d1.strftime('%y%m%d')}/{d2.strftime('%y%m%d')}/"
+            + dep_lower + "/" + arr_lower + "/" + d1.strftime("%y%m%d") + "/" + d2.strftime("%y%m%d") + "/"
         )
     if site == "Trip.com":
         return (
-            f"https://tw.trip.com/flights/showfarefirst?dcity={dep.lower()}&acity={arr.lower()}"
-            + f"&ddate={iso1}&rdate={iso2}&triptype=rt&class=y&quantity=1"
+            "https://tw.trip.com/flights/showfarefirst?dcity=" + dep_lower + "&acity=" + arr_lower
+            + "&ddate=" + iso1 + "&rdate=" + iso2 + "&triptype=rt&class=y&quantity=1"
         )
     if site == "KAYAK":
-        return f"https://www.kayak.com.tw/flights/{dep}-{arr}/{iso1}/{iso2}?sort=bestflight_a"
+        return "https://www.kayak.com.tw/flights/" + dep + "-" + arr + "/" + iso1 + "/" + iso2 + "?sort=bestflight_a"
     if site == "Expedia":
         us1, us2 = d1.strftime("%m/%d/%Y"), d2.strftime("%m/%d/%Y")
         return (
             "https://www.expedia.com.tw/Flights-Search?trip=roundtrip"
-            + f"&leg1=from:{dep},to:{arr},departure:{us1}TANYT"
-            + f"&leg2=from:{arr},to:{dep},departure:{us2}TANYT"
+            + "&leg1=from:" + dep + ",to:" + arr + ",departure:" + us1 + "TANYT"
+            + "&leg2=from:" + arr + ",to:" + dep + ",departure:" + us2 + "TANYT"
             + "&passengers=adults:1&mode=search"
         )
     if site == "momondo":
-        return f"https://www.momondo.tw/flight-search/{dep}-{arr}/{iso1}/{iso2}?sort=bestflight_a"
+        return "https://www.momondo.tw/flight-search/" + dep + "-" + arr + "/" + iso1 + "/" + iso2 + "?sort=bestflight_a"
     if site == "Booking.com":
         return (
-            f"https://flights.booking.com/flights/{dep}.AIRPORT-{arr}.AIRPORT/"
-            + f"?type=ROUNDTRIP&adults=1&cabinClass=ECONOMY&depart={iso1}&return={iso2}"
+            "https://flights.booking.com/flights/" + dep + ".AIRPORT-" + arr + ".AIRPORT/"
+            + "?type=ROUNDTRIP&adults=1&cabinClass=ECONOMY&depart=" + iso1 + "&return=" + iso2
         )
     if site == "ezTravel 易遊網":
         return (
-            f"https://flight.eztravel.com.tw/tickets-roundtrip-{dep.lower()}-{arr.lower()}"
-            + f"?outbounddate={d1.strftime('%Y/%m/%d')}&inbounddate={d2.strftime('%Y/%m/%d')}"
+            "https://flight.eztravel.com.tw/tickets-roundtrip-" + dep_lower + "-" + arr_lower
+            + "?outbounddate=" + d1.strftime("%Y/%m/%d") + "&inbounddate=" + d2.strftime("%Y/%m/%d")
         )
     if site == "Thai AirAsia 泰國亞洲航空":
         return (
-            f"https://www.airasia.com/flights/search/?origin={dep}&destination={arr}"
-            + f"&departDate={d1.strftime('%d/%m/%Y')}&returnDate={d2.strftime('%d/%m/%Y')}"
+            "https://www.airasia.com/flights/search/?origin=" + dep + "&destination=" + arr
+            + "&departDate=" + d1.strftime("%d/%m/%Y") + "&returnDate=" + d2.strftime("%d/%m/%Y")
             + "&tripType=R&adult=1&locale=zh-tw&currency=TWD"
         )
     if site == "EVA Air 長槮航空":
@@ -310,16 +300,13 @@ def build_booking_url(site: str, base_url: str, dep: str, arr: str, start: str, 
 
 
 def airlines_for_route(info: Dict[str, str]) -> List[tuple]:
-    """依 Trip database 的 `Nation` 屬性挑選常見航空公司組合；找不到對應國家就退回
-    DEFAULT_AIRLINES，確定任何目的地都能建立航班追蹤結構列（不再侵限泰國清邁）。
-    """
     nation = (info.get("nation") or "").strip()
     airlines = COUNTRY_AIRLINES.get(nation)
     if airlines is None:
         if not nation:
-            print(f"  Warn: journey '{info['title']}' has empty Nation; using default airline set.")
+            print("  Warn: journey '" + info["title"] + "' has empty Nation; using default airline set.")
         else:
-            print(f"  Note: no airline preset for Nation='{nation}'; using default airline set.")
+            print("  Note: no airline preset for Nation='" + nation + "'; using default airline set.")
         airlines = DEFAULT_AIRLINES
     dep_code = extract_airport_code(info["origin"]) or "TPE"
     arr_code = extract_airport_code(info["destination"])
@@ -329,7 +316,7 @@ def airlines_for_route(info: Dict[str, str]) -> List[tuple]:
 def rebuild_flight_rows(flight_db: str, info: Dict[str, str]) -> int:
     airlines = airlines_for_route(info)
     if not airlines:
-        print(f"  Skip flights: no airline mapping for route '{info['from_to'] or info['title']}'.")
+        print("  Skip flights: no airline mapping for route '" + (info["from_to"] or info["title"]) + "'.")
         return 0
     existing = existing_titles(flight_db, "航空公司")
     created = 0
@@ -340,20 +327,20 @@ def rebuild_flight_rows(flight_db: str, info: Dict[str, str]) -> int:
             "航空公司": notion_title(name),
             "到達機場": notion_text(arr_airport),
             "航廈位置": notion_text("（出發航廈待查）"),
-            "航班時間": notion_text(f"{info['start']} → {info['end']}（實際班表待查）"),
+            "航班時間": notion_text(info["start"] + " → " + info["end"] + "（實際班表待查）"),
             "直飛還是轉機": {"select": {"name": "直飛"}},
             "是否包含行李": {"checkbox": False},
         }
         create_db_row(flight_db, props, icon=favicon_icon(domain))
         existing.add(name)
         created += 1
-    print(f"  Flights: +{created} row(s).")
+    print("  Flights: +" + str(created) + " row(s).")
     return created
 
 
 def rebuild_price_site_rows(price_db: str, info: Dict[str, str]) -> int:
     if not info["start"]:
-        print(f"  Skip price sites: journey '{info['title']}' has no Trip Date.")
+        print("  Skip price sites: journey '" + info["title"] + "' has no Trip Date.")
         return 0
     existing = existing_titles(price_db, "網站名稱")
     dep_code = extract_airport_code(info["origin"]) or "TPE"
@@ -363,7 +350,7 @@ def rebuild_price_site_rows(price_db: str, info: Dict[str, str]) -> int:
     for site, base_url, airline_hint in FLIGHT_PRICE_SITES:
         if any(t.startswith(site) for t in existing):
             continue
-        title = f"{site}｜{info['origin']} → {info['destination']}｜{info['start']}–{info['end']}"
+        title = site + "｜" + info["origin"] + " → " + info["destination"] + "｜" + info["start"] + "–" + info["end"]
         booking_url = build_booking_url(site, base_url, dep_code, arr_code, info["start"], info["end"])
         props: Dict[str, Any] = {
             "網站名稱": notion_title(title),
@@ -378,17 +365,11 @@ def rebuild_price_site_rows(price_db: str, info: Dict[str, str]) -> int:
         create_db_row(price_db, props)
         existing.add(title)
         created += 1
-    print(f"  Price sites: +{created} row(s).")
+    print("  Price sites: +" + str(created) + " row(s).")
     return created
 
 
 def touch_trigger_property(database_id: str) -> bool:
-    """更新第一個找到的 Journey Task 之「航班追蹤」子 database 中任一列的
-    「上次觸發時間」屬性，藉此觸發 Notion 端監看該屬性變更的 Agent 開始查價。
-
-    取代舊的「在 GitHub Actions 執行日誌 database 新增一列」機制：
-    不用別外建立日誌資料庫，也不用多一次頁面建立 API 呼叫。
-    """
     journeys = query_all_pages(database_id)
     now_iso = datetime.now(timezone.utc).isoformat()
     for page in journeys:
@@ -406,7 +387,7 @@ def touch_trigger_property(database_id: str) -> bool:
             url,
             {"properties": {"上次觸發時間": {"date": {"start": now_iso}}}},
         )
-        print(f"Touched trigger property on flight row {target_id} (journey page {page['id']}).")
+        print("Touched trigger property on flight row " + target_id + " (journey page " + page["id"] + ").")
         return True
     print("No journey with a 航班追蹤 child database found; nothing to touch.", file=sys.stderr)
     return False
@@ -422,13 +403,13 @@ def main() -> int:
         return 0 if touch_trigger_property(database_id) else 1
 
     journeys = query_all_pages(database_id)
-    print(f"Found {len(journeys)} journey task(s) in Trip database.")
+    print("Found " + str(len(journeys)) + " journey task(s) in Trip database.")
     total_flights = 0
     total_sites = 0
 
     for page in journeys:
         info = parse_journey(page)
-        print(f"Journey: {info['title']}")
+        print("Journey: " + info["title"])
         dbs = find_child_databases(page["id"])
         flight_db = dbs.get("航班追蹤")
         price_db = dbs.get("票價網站資料")
@@ -440,7 +421,7 @@ def main() -> int:
         if price_db:
             total_sites += rebuild_price_site_rows(price_db, info)
 
-    print(f"Done. flights +{total_flights}, price sites +{total_sites}.")
+    print("Done. flights +" + str(total_flights) + ", price sites +" + str(total_sites) + ".")
     return 0
 
 
