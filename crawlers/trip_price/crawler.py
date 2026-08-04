@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Trip price crawler — samwi-dev/Notion-script · crawlers/trip_price
 
-2026-08 重寫版，对齊目前 Notion 架構：
+2026-08 重寫版，對齊目前 Notion 架構：
 - TRIP_DATABASE_ID 指向 Trip database；每一列 = 一個 Journey Task（一個旅程只保留一個 Task）
 - 每個 Journey Task 頁面內孌兩個子 database：
   - 「票價網站資料」：各比價網站報價（linked view「整月價格走勢」chart 的資料來源）
@@ -24,8 +24,12 @@
 
 2026-08-04 再次修正：對齊範本頁「New trip」目前的「航班追蹤」子 database 欄位，補上
 `航廈位置`（出發機場航廈）結構欄位，避免自動建立的列缺少此欄位；實際航廈仍留待 Notion AI
-查價／核实航班資訊時回填。「相關比價紀錄」「相關網站報價」「相關航班」等 relation 欄位維持
+查價／核實航班資訊時回填。「相關比價紀錄」「相關網站報價」「相關航班」等 relation 欄位維持
 不由爬蟲自動填寫（比價紀錄列尚未建立、且分工文件已註明三者雙向 relation 不自動同步）。
+
+2026-08-04 修復這次提交中發現的舊 bug：部分產生 URL 的 f-string 誤用 `{{`/`}}` 雙括號轉義，
+導致實際產生的網址包含字面上的 `{` `}` 字元（包括 Notion API 內部呼叫與 Trip.com、KAYAK、
+momondo、Booking.com、ezTravel、Thai AirAsia 的訂票深度連結）。已全部改回正常單括號內插。
 
 Required GitHub Actions secrets:
 - NOTION_TOKEN
@@ -65,8 +69,8 @@ FLIGHT_PRICE_SITES = [
 
 # 航班追蹤的航空公司對應：以 Trip database 的 `Nation`（目的地國家）屬性為 key。
 # 只放「該國家常見、大概率會直飛或轉機服務該航線」的參考組合；
-# 實际是否直飛、正確航班時間與價格仍由 Notion AI 查價流程核实並回填。
-# 找不到对應國家時一律退回 DEFAULT_AIRLINES，不再讓非泰國旅程整組被跳過。
+# 實际是否直飛、正確航班時間與價格仍由 Notion AI 查價流程核實並回填。
+# 找不到對應國家時一律退回 DEFAULT_AIRLINES，不再讓非泰國旅程整組被跳過。
 COUNTRY_AIRLINES: Dict[str, List[Tuple[str, str, str]]] = {
     "Thailand": [
         ("EVA Air 長槮航空", "www.evaair.com", "BR"),
@@ -146,7 +150,8 @@ def query_all_pages(database_id: str) -> List[dict]:
         payload: Dict[str, Any] = {"page_size": 100}
         if cursor:
             payload["start_cursor"] = cursor
-        data = http_json("POST", f"https://api.notion.com/v1/databases/{database_id}/query", payload)
+        url = "https://api.notion.com/v1/databases/" + database_id + "/query"
+        data = http_json("POST", url, payload)
         pages.extend(data.get("results", []))
         if not data.get("has_more"):
             break
@@ -158,7 +163,7 @@ def list_block_children(block_id: str) -> List[dict]:
     blocks: List[dict] = []
     cursor = None
     while True:
-        url = f"https://api.notion.com/v1/blocks/{block_id}/children?page_size=100"
+        url = "https://api.notion.com/v1/blocks/" + block_id + "/children?page_size=100"
         if cursor:
             url += "&start_cursor=" + urllib.parse.quote(cursor)
         data = http_json("GET", url)
@@ -227,7 +232,8 @@ def create_db_row(database_id: str, props: dict, icon: Optional[dict] = None) ->
 
 
 def favicon_icon(domain: str) -> dict:
-    return {"type": "external", "external": {"url": f"https://www.google.com/s2/favicons?domain={domain}&sz=128"}}
+    url = "https://www.google.com/s2/favicons?domain=" + domain + "&sz=128"
+    return {"type": "external", "external": {"url": url}}
 
 
 def _parse_iso_date(value: str) -> Optional[datetime]:
@@ -258,13 +264,13 @@ def build_booking_url(site: str, base_url: str, dep: str, arr: str, start: str, 
         return "https://www.google.com/travel/flights?q=" + urllib.parse.quote(q)
     if site == "Skyscanner":
         return (
-            f"https://www.skyscanner.com.tw/transport/flights/"
-            f"{dep.lower()}/{arr.lower()}/{d1.strftime('%y%m%d')}/{d2.strftime('%y%m%d')}/"
+            "https://www.skyscanner.com.tw/transport/flights/"
+            + f"{dep.lower()}/{arr.lower()}/{d1.strftime('%y%m%d')}/{d2.strftime('%y%m%d')}/"
         )
     if site == "Trip.com":
         return (
             f"https://tw.trip.com/flights/showfarefirst?dcity={dep.lower()}&acity={arr.lower()}"
-            f"&ddate={iso1}&rdate={iso2}&triptype=rt&class=y&quantity=1"
+            + f"&ddate={iso1}&rdate={iso2}&triptype=rt&class=y&quantity=1"
         )
     if site == "KAYAK":
         return f"https://www.kayak.com.tw/flights/{dep}-{arr}/{iso1}/{iso2}?sort=bestflight_a"
@@ -272,27 +278,27 @@ def build_booking_url(site: str, base_url: str, dep: str, arr: str, start: str, 
         us1, us2 = d1.strftime("%m/%d/%Y"), d2.strftime("%m/%d/%Y")
         return (
             "https://www.expedia.com.tw/Flights-Search?trip=roundtrip"
-            f"&leg1=from:{dep},to:{arr},departure:{us1}TANYT"
-            f"&leg2=from:{arr},to:{dep},departure:{us2}TANYT"
-            "&passengers=adults:1&mode=search"
+            + f"&leg1=from:{dep},to:{arr},departure:{us1}TANYT"
+            + f"&leg2=from:{arr},to:{dep},departure:{us2}TANYT"
+            + "&passengers=adults:1&mode=search"
         )
     if site == "momondo":
         return f"https://www.momondo.tw/flight-search/{dep}-{arr}/{iso1}/{iso2}?sort=bestflight_a"
     if site == "Booking.com":
         return (
             f"https://flights.booking.com/flights/{dep}.AIRPORT-{arr}.AIRPORT/"
-            f"?type=ROUNDTRIP&adults=1&cabinClass=ECONOMY&depart={iso1}&return={iso2}"
+            + f"?type=ROUNDTRIP&adults=1&cabinClass=ECONOMY&depart={iso1}&return={iso2}"
         )
     if site == "ezTravel 易遊網":
         return (
             f"https://flight.eztravel.com.tw/tickets-roundtrip-{dep.lower()}-{arr.lower()}"
-            f"?outbounddate={d1.strftime('%Y/%m/%d')}&inbounddate={d2.strftime('%Y/%m/%d')}"
+            + f"?outbounddate={d1.strftime('%Y/%m/%d')}&inbounddate={d2.strftime('%Y/%m/%d')}"
         )
     if site == "Thai AirAsia 泰國亞洲航空":
         return (
             f"https://www.airasia.com/flights/search/?origin={dep}&destination={arr}"
-            f"&departDate={d1.strftime('%d/%m/%Y')}&returnDate={d2.strftime('%d/%m/%Y')}"
-            "&tripType=R&adult=1&locale=zh-tw&currency=TWD"
+            + f"&departDate={d1.strftime('%d/%m/%Y')}&returnDate={d2.strftime('%d/%m/%Y')}"
+            + "&tripType=R&adult=1&locale=zh-tw&currency=TWD"
         )
     if site == "EVA Air 長槮航空":
         return "https://www.evaair.com/zh-tw/booking/book-flights/"
@@ -394,9 +400,10 @@ def touch_trigger_property(database_id: str) -> bool:
         if not rows:
             continue
         target_id = rows[0]["id"]
+        url = "https://api.notion.com/v1/pages/" + target_id
         http_json(
             "PATCH",
-            f"https://api.notion.com/v1/pages/{target_id}",
+            url,
             {"properties": {"上次觸發時間": {"date": {"start": now_iso}}}},
         )
         print(f"Touched trigger property on flight row {target_id} (journey page {page['id']}).")
