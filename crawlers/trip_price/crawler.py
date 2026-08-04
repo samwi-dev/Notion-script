@@ -22,6 +22,11 @@
 沒列出的國家一律退回 DEFAULT_AIRLINES（長槮／華航／星宇，台灣飛國际線最常見的組合），
 確定任何目的地都會有結構列可讓 Notion AI 之後查價校正，不再侵限泰國。
 
+2026-08-04 再次修正：對齊範本頁「New trip」目前的「航班追蹤」子 database 欄位，補上
+`航廈位置`（出發機場航廈）結構欄位，避免自動建立的列缺少此欄位；實際航廈仍留待 Notion AI
+查價／核实航班資訊時回填。「相關比價紀錄」「相關網站報價」「相關航班」等 relation 欄位維持
+不由爬蟲自動填寫（比價紀錄列尚未建立、且分工文件已註明三者雙向 relation 不自動同步）。
+
 Required GitHub Actions secrets:
 - NOTION_TOKEN
 - TRIP_DATABASE_ID
@@ -60,7 +65,7 @@ FLIGHT_PRICE_SITES = [
 
 # 航班追蹤的航空公司對應：以 Trip database 的 `Nation`（目的地國家）屬性為 key。
 # 只放「該國家常見、大概率會直飛或轉機服務該航線」的參考組合；
-# 實际是否直飛、正確航班時間與價格仍由 Notion AI 查價流程核实與回填。
+# 實际是否直飛、正確航班時間與價格仍由 Notion AI 查價流程核实並回填。
 # 找不到对應國家時一律退回 DEFAULT_AIRLINES，不再讓非泰國旅程整組被跳過。
 COUNTRY_AIRLINES: Dict[str, List[Tuple[str, str, str]]] = {
     "Thailand": [
@@ -328,6 +333,7 @@ def rebuild_flight_rows(flight_db: str, info: Dict[str, str]) -> int:
         props = {
             "航空公司": notion_title(name),
             "到達機場": notion_text(arr_airport),
+            "航廈位置": notion_text("（出發航廈待查）"),
             "航班時間": notion_text(f"{info['start']} → {info['end']}（實際班表待查）"),
             "直飛還是轉機": {"select": {"name": "直飛"}},
             "是否包含行李": {"checkbox": False},
