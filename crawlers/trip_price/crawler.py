@@ -23,7 +23,7 @@
 確定任何目的地都會有結構列可讓 Notion AI 之後查價校正，不再侵限泰國。
 
 2026-08-04 再次修正：對齊範本頁「New trip」目前的「航班追蹤」子 database 欄位，補上
-`航廈位置`（出發機場航廈）結構欄位，避免自動建立的列缺少此欄位；實際航廈仍留待 Notion AI
+`航廦位置`（出發機場航廈）結構欄位，避免自動建立的列缺少此欄位；實際航廈仍留待 Notion AI
 查價／核實航班資訊時回填。「相關比價紀錄」「相關網站報價」「相關航班」等 relation 欄位維持
 不由爬蟲自動填寫（比價紀錄列尚未建立、且分工文件已註明三者雙向 relation 不自動同步）。
 
@@ -31,6 +31,10 @@
 大括號字元（包括 Notion API 內部呼叫與 Trip.com、KAYAK、momondo、Booking.com、ezTravel、
 Thai AirAsia 的訂票深度連結）。已全部改用字串連接（+）重寫，不再使用容易誤寫的
 雙括號 f-string 轉義。
+
+2026-08-04 再修正：範本頁「航班追蹤」資料庫的實際屬性名稱是「航廦位置」（非常見的「廈」字
+異體字「廦」），先前程式碼誤寫為「航廈位置」，實際呼叫 Notion API 會因屬性不存在而失敗。
+已改為與資料庫 schema 完全一致的「航廦位置」。
 
 Required GitHub Actions secrets:
 - NOTION_TOKEN
@@ -326,7 +330,7 @@ def rebuild_flight_rows(flight_db: str, info: Dict[str, str]) -> int:
         props = {
             "航空公司": notion_title(name),
             "到達機場": notion_text(arr_airport),
-            "航廈位置": notion_text("（出發航廈待查）"),
+            "航廦位置": notion_text("（出發航廈待查）"),
             "航班時間": notion_text(info["start"] + " → " + info["end"] + "（實際班表待查）"),
             "直飛還是轉機": {"select": {"name": "直飛"}},
             "是否包含行李": {"checkbox": False},
