@@ -45,10 +45,16 @@ Travelpayouts 官方文件證實可用）、Traveloka（東南亞 OTA，區域�
 「⚠️ 動態即時比價網站」開頭加註提醒。
 
 2026-08-04 新增第 15 個票價平台：Airpaz（印尼發跡的東南亞 OTA，區域廉航票價常見更低，支援
-在地幣別與語言介面）。官網機票搜尋頁同樣沒有可證實的帶日期參數深度連結格式（已實际搜尋確認，
-只找到静態的 /en/flight 搜尋首頁），因此跟 Traveloka 同樣一律回傳 base_url，備註標明需手動輸入航線
-與日期，避免重演「連結格式猜錯」問題。同樣視為動態即時比價網站，備註需以「⚠️ 動態即時比價
-網站」開頭。
+在地幣別與語言介面）。
+
+2026-08-04 修正：先前判斷 Airpaz「沒有可證實的帶日期深度連結格式」是誤判——當時只查看了
+靜態的 /en/flight 搜尋首頁就下結論，沒有實際打開帶航線與日期的搜尋結果頁驗證；經使用者手動
+查詢後證實，Airpaz 官網搜尋結果頁的網址確實支援帶航線與日期的查詢參數（depAirport／
+arrAirport／depDate／adult／child／infant／currency／cabin）。已改為組出去程單程深度連結：
+https://www.airpaz.com/en/flight/search?depAirport=<出發>&arrAirport=<抵達>&depDate=<日期>
+&adult=1&child=0&infant=0&currency=TWD&cabin=economy 。回程日期尚未證實可用同一組 URL
+參數直接帶入（結果頁上方有日期切換列，需自行切換至回程日期查看），故僅組出去程深度連結，
+備註仍需以「⚠️ 動態即時比價網站」開頭並提醒回程日期需自行切換確認。
 
 Required GitHub Actions secrets:
 - NOTION_TOKEN
@@ -322,9 +328,14 @@ def build_booking_url(site: str, base_url: str, dep: str, arr: str, start: str, 
         # 「連結格式猜錯」問題，一律回傳機票搜尋頁 base_url，備註標明需手動輸入航線與日期。
         return base_url
     if site == "Airpaz":
-        # Airpaz 官網機票搜尋頁同樣沒有可證實的帶日期深度連結格式，一律回傳
-        # 機票搜尋首頁 base_url，備註標明需手動輸入航線與日期。
-        return base_url
+        # 2026-08-04 修正：先前誤判「Airpaz 沒有可證實的帶日期深度連結格式」——當時只看了
+        # 靜態首頁 /en/flight 就下結論，沒有實際打開搜尋結果頁驗證。使用者手動查詢後證實，
+        # Airpaz 搜尋結果頁的網址確實支援帶航線與日期的查詢參數，改為組出去程單程深度連結；
+        # 回程日期尚未證實可用同一組參數直接帶入，需在結果頁上方日期列自行切換確認。
+        return (
+            "https://www.airpaz.com/en/flight/search?depAirport=" + dep + "&arrAirport=" + arr
+            + "&depDate=" + iso1 + "&adult=1&child=0&infant=0&currency=TWD&cabin=economy"
+        )
     if site == "EVA Air 長槮航空":
         return "https://www.evaair.com/zh-tw/booking/book-flights/"
     if site == "China Airlines 中華航空":
