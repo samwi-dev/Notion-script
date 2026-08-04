@@ -2,20 +2,25 @@
 # -*- coding: utf-8 -*-
 """Trip price crawler — samwi-dev/Notion-script · crawlers/trip_price
 
-2026-08 重寫版，對齊目前 Notion 架構：
+2026-08 重寫版，对齊目前 Notion 架構：
 - TRIP_DATABASE_ID 指向 Trip database；每一列 = 一個 Journey Task（一個旅程只保留一個 Task）
-- 每個 Journey Task 頁面內嵌兩個子 database：
+- 每個 Journey Task 頁面內孌兩個子 database：
   - 「票價網站資料」：各比價網站報價（linked view「整月價格走勢」chart 的資料來源）
   - 「航班追蹤」：本旅程航班（page icon 使用航空公司官網 favicon）
 - 爬蟲負責「重建結構」：補齊航班追蹤的直飛航空公司、票價網站資料的各網站報價列
 - 去重：航班追蹤以「航空公司」title、票價網站資料以「網站名稱」前綴判斷，可每日重複執行
 - 訂票連結：使用各平台真正的深度連結格式（帶航線與日期參數，點開直接顯示搜尋結果）；
   航空公司官網不支援帶日期深度連結，連到訂票頁
-- 實際價格由比價流程查詢後回填（統一 TWD，備註保留原始幣別與換算依據）
+- 實际價格由比價流程查詢後回填（統一 TWD，備註保留原始幣別與換算依據）
 
-2026-08-04 觸發機制精簡：不再另外寫「GitHub Actions 執行日誌」資料庫來觸發 Notion AI Agent。
+2026-08-04 觸發機制精簡：不再別外寫「GitHub Actions 執行日誌」資料庫來觸發 Notion AI Agent。
 改為執行 `--touch-trigger` 時，直接更新「航班追蹤」子 database 中第一列的「上次觸發時間」
 屬性；Notion 端 Agent 監看該屬性變更即會自動觸發，省去一層日誌資料庫與一次額外的頁面建立。
+
+2026-08-04 修正：航班追蹤的航空公司對應原本硬寫死只認泰國清邁（CNX），非清邁旅程完全不會
+補上航班列。改為以 Trip database 的 `Nation` 屬性查通用的 COUNTRY_AIRLINES 對照表；
+沒列出的國家一律退回 DEFAULT_AIRLINES（長槮／華航／星宇，台灣飛國际線最常見的組合），
+確定任何目的地都會有結構列可讓 Notion AI 之後查價校正，不再侵限泰國。
 
 Required GitHub Actions secrets:
 - NOTION_TOKEN
@@ -33,7 +38,7 @@ import urllib.parse
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 NOTION_VERSION = "2022-06-28"
 WRITE_DELAY_SEC = 0.35
@@ -47,17 +52,36 @@ FLIGHT_PRICE_SITES = [
     ("momondo", "https://www.momondo.com/flight-search", "多家航空公司比價"),
     ("Booking.com", "https://www.booking.com/flights", "多家航空公司比價"),
     ("ezTravel 易遊網", "https://www.eztravel.com.tw", "多家航空公司比價"),
-    ("EVA Air 長榮航空", "https://www.evaair.com", "EVA Air 長榮航空"),
+    ("EVA Air 長槮航空", "https://www.evaair.com", "EVA Air 長槮航空"),
     ("China Airlines 中華航空", "https://www.china-airlines.com", "China Airlines 中華航空"),
     ("STARLUX Airlines 星宇航空", "https://www.starlux-airlines.com", "STARLUX Airlines 星宇航空"),
     ("Thai AirAsia 泰國亞洲航空", "https://www.airasia.com", "Thai AirAsia 泰國亞洲航空"),
 ]
 
-CNX_AIRLINES = [
-    ("EVA Air 長榮航空", "www.evaair.com", "BR", "TPE", "CNX"),
-    ("China Airlines 中華航空", "www.china-airlines.com", "CI", "TPE", "CNX"),
-    ("STARLUX Airlines 星宇航空", "www.starlux-airlines.com", "JX", "TPE", "CNX"),
-    ("Thai AirAsia 泰國亞洲航空", "www.airasia.com", "FD", "TPE", "CNX"),
+# 航班追蹤的航空公司對應：以 Trip database 的 `Nation`（目的地國家）屬性為 key。
+# 只放「該國家常見、大概率會直飛或轉機服務該航線」的參考組合；
+# 實际是否直飛、正確航班時間與價格仍由 Notion AI 查價流程核实與回填。
+# 找不到对應國家時一律退回 DEFAULT_AIRLINES，不再讓非泰國旅程整組被跳過。
+COUNTRY_AIRLINES: Dict[str, List[Tuple[str, str, str]]] = {
+    "Thailand": [
+        ("EVA Air 長槮航空", "www.evaair.com", "BR"),
+        ("China Airlines 中華航空", "www.china-airlines.com", "CI"),
+        ("STARLUX Airlines 星宇航空", "www.starlux-airlines.com", "JX"),
+        ("Thai AirAsia 泰國亞洲航空", "www.airasia.com", "FD"),
+    ],
+    "Japan": [
+        ("EVA Air 長槮航空", "www.evaair.com", "BR"),
+        ("China Airlines 中華航空", "www.china-airlines.com", "CI"),
+        ("STARLUX Airlines 星宇航空", "www.starlux-airlines.com", "JX"),
+        ("Tigerair Taiwan 台灣虎航", "www.tigerairtw.com", "IT"),
+    ],
+}
+
+# 找不到 Nation 對應表時的預設組合：台灣飛國际線最常見的全服務／新興業者。
+DEFAULT_AIRLINES: List[Tuple[str, str, str]] = [
+    ("EVA Air 長槮航空", "www.evaair.com", "BR"),
+    ("China Airlines 中華航空", "www.china-airlines.com", "CI"),
+    ("STARLUX Airlines 星宇航空", "www.starlux-airlines.com", "JX"),
 ]
 
 
@@ -141,7 +165,7 @@ def list_block_children(block_id: str) -> List[dict]:
 
 
 def find_child_databases(page_id: str) -> Dict[str, str]:
-    """回傳 {title: database_id}。只收頁面內嵌的子 database，排除 linked view（標題為 'View of ...'）。"""
+    """回傳 {title: database_id}。只收頁面內孌的子 database，排除 linked view（標題為 'View of ...'）。"""
     found: Dict[str, str] = {}
     for block in list_block_children(page_id):
         if block.get("type") != "child_database":
@@ -158,6 +182,7 @@ def parse_journey(page: dict) -> Dict[str, str]:
     title = text_prop(page, "Deal Title")
     from_to = text_prop(page, "From-To")
     summary = text_prop(page, "Summary")
+    nation = text_prop(page, "Nation")
     trip_date = (props.get("Trip Date") or {}).get("date") or {}
     start = trip_date.get("start") or ""
     end = trip_date.get("end") or ""
@@ -171,6 +196,7 @@ def parse_journey(page: dict) -> Dict[str, str]:
         "title": title,
         "from_to": from_to,
         "summary": summary,
+        "nation": nation,
         "origin": origin,
         "destination": destination,
         "start": start,
@@ -263,7 +289,7 @@ def build_booking_url(site: str, base_url: str, dep: str, arr: str, start: str, 
             f"&departDate={d1.strftime('%d/%m/%Y')}&returnDate={d2.strftime('%d/%m/%Y')}"
             "&tripType=R&adult=1&locale=zh-tw&currency=TWD"
         )
-    if site == "EVA Air 長榮航空":
+    if site == "EVA Air 長槮航空":
         return "https://www.evaair.com/zh-tw/booking/book-flights/"
     if site == "China Airlines 中華航空":
         return "https://www.china-airlines.com/tw/zh/booking/book-flights"
@@ -273,10 +299,20 @@ def build_booking_url(site: str, base_url: str, dep: str, arr: str, start: str, 
 
 
 def airlines_for_route(info: Dict[str, str]) -> List[tuple]:
-    text = f"{info['destination']} {info['title']} {info['summary']}"
-    if any(k in text for k in ("清邁", "Chiang Mai", "CNX")):
-        return CNX_AIRLINES
-    return []
+    """依 Trip database 的 `Nation` 屬性挑選常見航空公司組合；找不到對應國家就退回
+    DEFAULT_AIRLINES，確定任何目的地都能建立航班追蹤結構列（不再侵限泰國清邁）。
+    """
+    nation = (info.get("nation") or "").strip()
+    airlines = COUNTRY_AIRLINES.get(nation)
+    if airlines is None:
+        if not nation:
+            print(f"  Warn: journey '{info['title']}' has empty Nation; using default airline set.")
+        else:
+            print(f"  Note: no airline preset for Nation='{nation}'; using default airline set.")
+        airlines = DEFAULT_AIRLINES
+    dep_code = extract_airport_code(info["origin"]) or "TPE"
+    arr_code = extract_airport_code(info["destination"])
+    return [(name, domain, code, dep_code, arr_code) for name, domain, code in airlines]
 
 
 def rebuild_flight_rows(flight_db: str, info: Dict[str, str]) -> int:
@@ -339,7 +375,7 @@ def touch_trigger_property(database_id: str) -> bool:
     「上次觸發時間」屬性，藉此觸發 Notion 端監看該屬性變更的 Agent 開始查價。
 
     取代舊的「在 GitHub Actions 執行日誌 database 新增一列」機制：
-    不用另外建立日誌資料庫，也不用多一次頁面建立 API 呼叫。
+    不用別外建立日誌資料庫，也不用多一次頁面建立 API 呼叫。
     """
     journeys = query_all_pages(database_id)
     now_iso = datetime.now(timezone.utc).isoformat()
