@@ -1,16 +1,16 @@
-name: Trip Price Crawler
+name: Trip Price Task Builder
 
 on:
   workflow_dispatch:
   schedule:
-    # 01:00 UTC = 09:00 Asia/Taipei，每天執行（只跑 Step 1 結構維護，0 credit）
+    # 01:00 UTC = 09:00 Asia/Taipei，每天執行 Step 1 結構／查價任務維護
     - cron: "0 1 * * *"
 
 permissions:
   contents: read
 
 jobs:
-  trip-price-crawler:
+  trip-price-task-builder:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Step 1 — Rebuild structure rows (flights + price sites)
+      - name: Step 1 — Build structure and price task rows
         id: step1
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -31,12 +31,11 @@ jobs:
         run: python crawlers/trip_price/crawler.py
 
       # Step 2 — 觸發 Notion AI Agent 查價（會用到 Notion AI credit）
-      # 2026-08-04 起改為直接更新「航班追蹤」子 database 的「上次觸發時間」屬性，
-      # 不再另外寫「GitHub Actions 執行日誌」資料庫；Notion 端 Agent 監看該屬性變更即會自動觸發。
+      # GitHub Actions 不再直接解析即時票價；只建立可查價 task rows 與正確訂票連結。
       # 為節省 credit，只在以下情況執行：
       #   1. 每週一（自動，每週只用 1 次 credit）
       #   2. 手動 Run workflow（想更新票價時隨時可觸發）
-      - name: Step 2 — Touch trigger property (weekly or manual only)
+      - name: Step 2 — Touch trigger property for Notion AI pricing
         if: always()
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
