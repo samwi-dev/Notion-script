@@ -12,7 +12,7 @@ permissions:
 jobs:
   trip-price-task-builder:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
@@ -36,12 +36,10 @@ jobs:
           TRIP_DATABASE_ID: ${{ secrets.TRIP_DATABASE_ID }}
         run: python crawlers/trip_price/crawler.py
 
-      # Step 2 — 觸發 Notion AI Agent 查價（會用到 Notion AI credit）
-      # GitHub Actions 不再直接解析即時票價；只建立可查價 task rows 與正確訂票連結。
-      # 為節省 credit，只在以下情況執行：
-      #   1. 每週一（自動，每週只用 1 次 credit）
-      #   2. 手動 Run workflow（想更新票價時隨時可觸發）
-      - name: Step 2 — Touch trigger property for Notion AI pricing
+      # Step 2 — Touch trigger property for optional Notion AI/manual follow-up.
+      # 2026-08-06 起 Step 3 已改為 15 個平台全部嘗試 Playwright + Groq 查價；
+      # Notion AI 不再固定負責特定平台，只作為補查與修正輔助。
+      - name: Step 2 — Touch trigger property for follow-up
         if: always()
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -57,11 +55,11 @@ jobs:
           fi
           python crawlers/trip_price/crawler.py --touch-trigger
 
-      # Step 3 — Playwright 實測開頁擷取 + Groq 正規化，補上 Notion AI Agent 查不到精確價的動態渲染平台
-      # （Google Flights / Skyscanner / Trip.com / KAYAK / Expedia / momondo / Booking.com / ezTravel /
-      # 中華航空 / 星宇航空 / AirAsia，完整清單見 crawlers/trip_price/browser_fetch.py 的 PLATFORM_CONFIG）。
-      # 其餘平台（Kiwi.com、Traveloka、Airpaz、EVA Air 等）仍交由 Step 2 的 Notion AI Agent 查價，不受影響。
-      - name: Step 3 — Playwright + Groq price fetch for target platforms
+      # Step 3 — Playwright 實測開頁擷取 + Groq 正規化。
+      # 2026-08-06 起改為全部 15 個平台都嘗試：Google Flights / Skyscanner / Trip.com / KAYAK /
+      # Expedia / momondo / Booking.com / ezTravel / EVA / 華航 / 星宇 / AirAsia / Kiwi / Traveloka / Airpaz。
+      # 抓不到的列會寫 confidence=0 與原因，保留待 Notion AI / 人工補查。
+      - name: Step 3 — Playwright + Groq price fetch for all platforms
         if: always()
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}

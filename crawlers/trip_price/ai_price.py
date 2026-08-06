@@ -2,20 +2,15 @@
 # -*- coding: utf-8 -*-
 """ai_price.py - samwi-dev/Notion-script / crawlers/trip_price
 
-Step 3：對 browser_fetch.py 覆蓋的目標平台（Notion AI Agent 查不到精確價的動態渲染網站），
-把實際擷取到的原始價格文字用 Groq 正規化成結構化 JSON，回填 Notion「票價網站資料」子資料庫。
+Step 3：對 Trip「票價網站資料」15 個平台全部嘗試 Playwright + Groq 查價，
+把 browser_fetch.py 實際擷取到的原始價格文字用 Groq 正規化成結構化 JSON，回填 Notion。
 
-⚠️ 2026-07-17 起 Amadeus Flight Offers Search API 已停用，本檔案舊版 Amadeus 查價邏輯已完全移除，
-改用 browser_fetch.py（Playwright）+ Groq 正規化取代。
+⚠️ 2026-07-17 起 Amadeus Flight Offers Search API 已停用，本檔案舊版 Amadeus 查價邏輯已完全移除。
 
-三步驟分工：
-- crawler.py：建立 Journey Task 結構、訂票連結（Step 1）
-- Notion AI Agent：查詢 Kiwi.com / Traveloka / Airpaz / EVA Air 等平台（Step 2，現況不動）
-- browser_fetch.py + ai_price.py（本檔案）：Playwright 實測開頁擷取 + Groq 正規化，
-  補上 Notion AI Agent 查不到的動態渲染平台（Google Flights / Trip.com / Skyscanner 等，Step 3）
+2026-08-06 更新：取消 11 + 4 固定分工，全部平台合併由 GitHub Actions Step 3 嘗試。
+Notion AI / 人工只作為補查與修正輔助；不再固定負責 EVA / Kiwi / Traveloka / Airpaz。
 
-Notion API 呼叫沿用 crawler.py 既有的 http_json() / query_all_pages() / find_child_databases() /
-text_prop() / notion_text() 等 helper，不重新發明一份 Notion API 邏輯。
+Notion API 呼叫沿用 crawler.py 既有 helper，不重新發明一份 Notion API 邏輯。
 
 Required secrets:
   NOTION_TOKEN
@@ -44,13 +39,10 @@ from browser_fetch import PLATFORM_CONFIG, fetch_price
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 WRITE_DELAY_SEC = 0.4
-# Notion「票價網站資料」的「幣別」select 目前既有選項；只在這個範圍內才寫入 select，
-# 避免程式自動新增 select 選項等於修改 Notion schema（不在本次授權範圍內）。
-KNOWN_CURRENCY_OPTIONS = {"TWD", "THB", "USD"}
 
 
 def _run_prompt(client: Any, prompt: str, retries: int = 3) -> dict:
-    """呼叫 Groq；429 / rate limit 遞增等待重試 3 次，其餘錯誤直接拋出（同 news-crawler/analyzer.py 的 _run_prompt）。"""
+    """呼叫 Groq；429 / rate limit 遞增等待重試 3 次。"""
     for attempt in range(retries):
         try:
             response = client.chat.completions.create(
@@ -86,7 +78,7 @@ def normalize_price(client: Any, platform: str, raw_text: str, route_hint: str) 
         "{\n"
         "  \"platform\": \"" + platform + "\",\n"
         "  \"price_local\": 原始幣別下的數字（找不到則 null）,\n"
-        "  \"currency\": \"幣別代碼，例如 TWD/USD/THB/JPY（找不到則 null）\",\n"
+        "  \"currency\": \"原始幣別代碼，例如 TWD/USD/THB/JPY（找不到則 null）\",\n"
         "  \"price_twd\": 換算為台幣後的整數（找不到則 null）,\n"
         "  \"confidence\": 0到5的整數（0=完全無法判斷, 5=非常確定的即時報價）,\n"
         "  \"is_dynamic_estimate\": true 或 false,\n"
@@ -111,7 +103,7 @@ def normalize_price(client: Any, platform: str, raw_text: str, route_hint: str) 
 
 
 def get_database_properties(database_id: str) -> Set[str]:
-    """查詢子資料庫現有 schema 的屬性名稱；寫入前用來檢查欄位是否存在，避免假設不存在的欄位而炸掉。"""
+    """查詢子資料庫現有 schema 的屬性名稱；寫入前用來檢查欄位是否存在。"""
     try:
         data = http_json("GET", "https://api.notion.com/v1/databases/" + database_id)
         return set(data.get("properties", {}).keys())
@@ -127,7 +119,7 @@ def route_hint_text(info: Dict[str, str]) -> str:
 def build_note(result: Dict[str, Any]) -> str:
     parts = []
     if result.get("price_local") is not None and result.get("currency"):
-        parts.append("原始報價：" + str(result["currency"]) + " " + str(result["price_local"]))
+        parts.append("原始報價：" + str(result["currency"]).upper() + " " + str(result["price_local"]))
     parts.append("confidence=" + str(result.get("confidence", 0)))
     if result.get("is_dynamic_estimate"):
         parts.append("⚠️ 非即時精確報價，僅供參考")
@@ -154,11 +146,6 @@ def process_price_db(client: Optional[Any], price_db_id: str, info: Dict[str, st
             site_title = text_prop(row, "網站名稱")
             site_name = site_title.split("｜")[0].strip() if "｜" in site_title else site_title
             if site_name not in PLATFORM_CONFIG:
-                continue  # 不在 browser_fetch 目標清單：交由 Notion AI Agent 查價，不動它
-
-            existing_price = row.get("properties", {}).get("票價", {}).get("number")
-            if existing_price is not None:
-                print("  [" + site_name + "] skip (already has price " + str(existing_price) + ")")
                 continue
 
             booking_url = text_prop(row, "訂票連結")
@@ -204,10 +191,10 @@ def process_price_db(client: Optional[Any], price_db_id: str, info: Dict[str, st
             price_twd = result.get("price_twd")
             if isinstance(price_twd, (int, float)):
                 props["票價"] = {"number": price_twd}
-
-            currency = str(result.get("currency") or "").upper()
-            if currency in KNOWN_CURRENCY_OPTIONS:
-                props["幣別"] = {"select": {"name": currency}}
+                # 票價欄位一律存「換算後 TWD 數字」；原始幣別只保留在備註，避免出現 6800 USD 這種誤導。
+                props["幣別"] = {"select": {"name": "TWD"}}
+            elif "幣別" in schema_props:
+                props["幣別"] = {"select": {"name": "TWD"}}
 
             http_json("PATCH", "https://api.notion.com/v1/pages/" + row["id"], {"properties": props})
             time.sleep(WRITE_DELAY_SEC)

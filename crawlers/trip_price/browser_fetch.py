@@ -4,17 +4,14 @@
 
 用 Playwright headless Chromium 實際開啟訂票深連結，擷取頁面上的價格文字。
 
-背景：Notion AI Agent 沒有瀏覽器渲染能力，實測查不到以下平台指定日期的精確價格：
-Google Flights、Skyscanner、Trip.com、KAYAK、Expedia、momondo、Booking.com、
-ezTravel 易遊網、China Airlines 中華航空、STARLUX Airlines 星宇航空、AirAsia 亞洲航空集團。
-本檔案只負責這些目標平台；其餘平台（EVA Air 長榮航空、Kiwi.com、Traveloka、Airpaz 等）
-已知能透過 Notion AI Agent 查到，維持現況、不受本檔案影響。
+2026-08-06 更新：Step 3 改為「全部平台合併不分工」。
+GitHub Actions 會對 Trip 票價網站資料的 15 個平台全部嘗試 Playwright + Groq 查價；
+Notion AI / 人工只作為補查與修正輔助，不再固定負責特定 4 個平台。
 
 深連結產生邏輯直接重用 crawler.py 既有的 build_booking_url() / FLIGHT_PRICE_SITES，
 本檔案不重複維護一份平台 URL 模板。
 
-設計：設定表（PLATFORM_CONFIG）驅動 + 共用 fetch_price()，而不是每平台一個檔案
-（15 個平台選擇器邏輯相似，設定表比雷同小檔更合理）。
+設計：設定表（PLATFORM_CONFIG）驅動 + 共用 fetch_price()，而不是每平台一個檔案。
 
 Required:
   pip install playwright
@@ -40,19 +37,12 @@ GENERIC_PRICE_REGEX = r"(?:NT\$|US\$|HK\$|S\$|TWD\s?|THB\s?|JPY\s?|¥|\$)\s?[\d]
 # 平台設定表：wait_selector（等待渲染完成用的 CSS selector，可為 None 只靠 extra_wait_ms）、
 # price_selector（優先用的 CSS selector，抓不到再退用 price_regex）、price_regex（抓不到 selector 時
 # 對整頁文字做的正規表示式）、timeout（頁面 navigation 逾時 ms）、extra_wait_ms（JS 動態渲染緩衝等待）。
+# 2026-08-06：15 個平台全部列入 Step 3；抓不到則 confidence=0 並保留待補查備註。
 PLATFORM_CONFIG: Dict[str, Dict[str, Any]] = {
     "Google Flights": {
         "wait_selector": None,
         "price_selector": None,
         "price_regex": r"Cheapest\s+from\s+(?:NT\$|US\$|\$)[\d,]+",
-        "timeout": 30000,
-        "extra_wait_ms": 15000,
-    },
-    "Trip.com": {
-        "wait_selector": None,
-        "price_selector": None,
-        # Trip.com 依語系顯示「Cheapest」或「最低價」，幣別可能是 US$/NT$/TWD。
-        "price_regex": r"(?:Cheapest|最低價)\s+(?:US\$|NT\$|TWD|\$)[\d,]+",
         "timeout": 30000,
         "extra_wait_ms": 15000,
     },
@@ -62,6 +52,13 @@ PLATFORM_CONFIG: Dict[str, Dict[str, Any]] = {
         "price_regex": GENERIC_PRICE_REGEX,
         "timeout": 25000,
         "extra_wait_ms": 8000,
+    },
+    "Trip.com": {
+        "wait_selector": None,
+        "price_selector": None,
+        "price_regex": r"(?:Cheapest|最低價)\s+(?:US\$|NT\$|TWD|\$)[\d,]+",
+        "timeout": 30000,
+        "extra_wait_ms": 15000,
     },
     "KAYAK": {
         "wait_selector": None,
@@ -98,26 +95,54 @@ PLATFORM_CONFIG: Dict[str, Dict[str, Any]] = {
         "timeout": 25000,
         "extra_wait_ms": 8000,
     },
+    "EVA Air 長榮航空": {
+        "wait_selector": None,
+        "price_selector": None,
+        "price_regex": GENERIC_PRICE_REGEX,
+        "timeout": 25000,
+        "extra_wait_ms": 10000,
+    },
     "China Airlines 中華航空": {
         "wait_selector": None,
         "price_selector": None,
         "price_regex": GENERIC_PRICE_REGEX,
-        "timeout": 20000,
-        "extra_wait_ms": 6000,
+        "timeout": 25000,
+        "extra_wait_ms": 10000,
     },
     "STARLUX Airlines 星宇航空": {
         "wait_selector": None,
         "price_selector": None,
         "price_regex": GENERIC_PRICE_REGEX,
-        "timeout": 20000,
-        "extra_wait_ms": 6000,
+        "timeout": 25000,
+        "extra_wait_ms": 10000,
     },
     "AirAsia 亞洲航空集團": {
         "wait_selector": None,
         "price_selector": None,
         "price_regex": GENERIC_PRICE_REGEX,
-        "timeout": 20000,
-        "extra_wait_ms": 8000,
+        "timeout": 25000,
+        "extra_wait_ms": 10000,
+    },
+    "Kiwi.com": {
+        "wait_selector": None,
+        "price_selector": None,
+        "price_regex": GENERIC_PRICE_REGEX,
+        "timeout": 30000,
+        "extra_wait_ms": 12000,
+    },
+    "Traveloka": {
+        "wait_selector": None,
+        "price_selector": None,
+        "price_regex": GENERIC_PRICE_REGEX,
+        "timeout": 25000,
+        "extra_wait_ms": 10000,
+    },
+    "Airpaz": {
+        "wait_selector": None,
+        "price_selector": None,
+        "price_regex": GENERIC_PRICE_REGEX,
+        "timeout": 25000,
+        "extra_wait_ms": 10000,
     },
 }
 
