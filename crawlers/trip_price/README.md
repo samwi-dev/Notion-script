@@ -1,11 +1,27 @@
 # Trip Price Crawler
 
-自動抓取台北→清邁機票價格並回填 Notion。
+自動維護機票／飯店比價任務結構，並針對 Notion AI Agent 查不到精確價的動態渲染網站，
+用 Playwright 實際開頁擷取價格後交給 Groq 正規化，回填 Notion。
 
-## 運作方式
+## 運作方式（三步驟）
 
-1. **Step 1 (`crawler.py`)** - 爬取各訂票網站的基本資訊（網站名稱、訂票連結等）
-2. **Step 2 (`ai_price.py`)** - 使用 **Amadeus Flight Offers Search API** 查詢真實票價並回填 Notion
+1. **Step 1（`crawler.py`）** — 讀取 Trip database 的每個 Journey Task；確保「航班追蹤」與
+   「票價網站資料」子資料庫存在，產生各平台正確的訂票深連結，標記為待查價。
+2. **Step 2（Notion AI Agent）** — 對 Kiwi.com、Traveloka、Airpaz、EVA Air 等 Notion AI Agent
+   能查到精確價的平台，用 `crawler.py --touch-trigger` 戳動「上次觸發時間」屬性，交由 Notion 內建
+   AI Agent 查價回填。此步驟現況不動，維持原本節省 Notion AI credit 的排程（每週一或手動觸發）。
+3. **Step 3（`browser_fetch.py` + `ai_price.py`）** — Notion AI Agent 沒有瀏覽器渲染能力，實測查不到
+   以下平台指定日期的精確價：Google Flights、Skyscanner、Trip.com、KAYAK、Expedia、momondo、
+   Booking.com、ezTravel 易遊網、China Airlines 中華航空、STARLUX Airlines 星宇航空、
+   AirAsia 亞洲航空集團。針對這些平台改用 `browser_fetch.py`（Playwright headless Chromium）實際
+   開啟訂票深連結擷取價格文字，再由 `ai_price.py` 呼叫 Groq 正規化成結構化 JSON 回填 Notion。
+
+## ⚠️ Amadeus API 已廢棄
+
+`ai_price.py` 舊版使用 Amadeus Flight Offers Search API 查價，但該路徑從未被
+`.github/workflows/trip-price-crawler.yml` 呼叫過，且 **Amadeus API 已於 2026-07-17 停用**。
+`ai_price.py` 已改寫為 Playwright + Groq 架構，不再使用 Amadeus，`AMADEUS_API_KEY` /
+`AMADEUS_API_SECRET` 兩個舊 secret 名稱已不再需要（歷史備註，非需要設定的 secrets）。
 
 ## 必要 Secrets 設定
 
@@ -14,32 +30,23 @@
 | Secret 名稱 | 說明 |
 |---|---|
 | `NOTION_TOKEN` | Notion Integration Token |
-| `TRIP_DATABASE_ID` | Notion 行程資料庫 ID |
-| `AMADEUS_API_KEY` | Amadeus Developer API Key |
-| `AMADEUS_API_SECRET` | Amadeus Developer API Secret |
+| `TRIP_DATABASE_ID` | Notion Trip 資料庫 ID |
+| `GROQ_API_KEY` | Groq API Key，用於 Step 3 價格文字正規化（於 [console.groq.com/keys](https://console.groq.com/keys) 免費取得） |
 
-## 取得 Amadeus 免費 API 金鑰
+未設定 `GROQ_API_KEY` 時，Step 3 仍會執行 `browser_fetch.py` 擷取，但只會把原始擷取文字存進「備註」，
+不做 LLM 正規化（降級行為，不會讓整個 workflow 失敗）。
 
-1. 前往 [https://developers.amadeus.com/register](https://developers.amadeus.com/register) 免費註冊
-2. 登入後進入 My Apps → Create New App
-3. 複製 **API Key** 和 **API Secret**
-4. 貼到 GitHub Secrets
+## 本機測試 browser_fetch.py
 
-> ✅ 免費帳號每月 2,000 次 API 呼叫，足夠每日自動排程使用
-
-## Amadeus API 說明
-
-- 使用 `/v2/shopping/flight-offers` 端點
-- 可指定出發地、目的地、日期、航空公司
-- 回傳來回含稅 TWD 票價
-- 直飛優先（`nonStop=true`），若查無直飛自動改含轉機
+```bash
+pip install playwright
+playwright install chromium
+python crawlers/trip_price/browser_fetch.py "Google Flights" "https://www.google.com/travel/flights?q=..."
+```
 
 ## 觸發方式
 
-```yaml
-# 手動觸發
-github.com → Actions → Trip Price Crawler → Run workflow
-
-# 自動排程（workflow 內設定）
-cron: '0 2 * * 1'  # 每週一 UTC 02:00 (台灣時間 10:00)
+```text
+手動觸發：github.com → Actions → Trip Price Task Builder → Run workflow
+自動排程：cron: "0 1 * * *"（UTC 01:00 = 台北時間 09:00，每天執行）
 ```

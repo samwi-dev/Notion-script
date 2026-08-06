@@ -107,15 +107,30 @@ def notion_headers() -> Dict[str, str]:
     }
 
 
-def http_json(method: str, url: str, payload: Optional[dict] = None) -> dict:
+def http_json(method: str, url: str, payload: Optional[dict] = None, retries: int = 3) -> dict:
+    """呼叫 Notion API；429 / 5xx / 逾時做遞增等待重試（3 次），其餘錯誤直接拋出。"""
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers=notion_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=45) as res:
-            return json.loads(res.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError("Notion API " + method + " " + url + " -> HTTP " + str(e.code) + ": " + body) from e
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=data, method=method, headers=notion_headers())
+        try:
+            with urllib.request.urlopen(req, timeout=45) as res:
+                return json.loads(res.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            if e.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                wait = 10 * (attempt + 1)
+                print("  Notion API HTTP " + str(e.code) + ", waiting " + str(wait) + "s before retry " + str(attempt + 2) + "/" + str(retries) + "...")
+                time.sleep(wait)
+                continue
+            raise RuntimeError("Notion API " + method + " " + url + " -> HTTP " + str(e.code) + ": " + body) from e
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt < retries - 1:
+                wait = 10 * (attempt + 1)
+                print("  Notion API connection error (" + str(e) + "), waiting " + str(wait) + "s before retry " + str(attempt + 2) + "/" + str(retries) + "...")
+                time.sleep(wait)
+                continue
+            raise RuntimeError("Notion API " + method + " " + url + " -> connection error: " + str(e)) from e
+    raise RuntimeError("Notion API " + method + " " + url + " -> retries exhausted")
 
 
 def text_prop(page: dict, name: str) -> str:
@@ -406,18 +421,22 @@ def main() -> int:
     total_sites = 0
 
     for page in journeys:
-        info = parse_journey(page)
-        print("Journey: " + info["title"])
-        dbs = find_child_databases(page["id"])
-        flight_db = dbs.get("航班追蹤")
-        price_db = dbs.get("票價網站資料")
-        if not flight_db and not price_db:
-            print("  Skip: page has no 航班追蹤 / 票價網站資料 child database.")
+        try:
+            info = parse_journey(page)
+            print("Journey: " + info["title"])
+            dbs = find_child_databases(page["id"])
+            flight_db = dbs.get("航班追蹤")
+            price_db = dbs.get("票價網站資料")
+            if not flight_db and not price_db:
+                print("  Skip: page has no 航班追蹤 / 票價網站資料 child database.")
+                continue
+            if flight_db:
+                total_flights += rebuild_flight_rows(flight_db, info)
+            if price_db:
+                total_sites += rebuild_price_site_rows(price_db, info)
+        except Exception as e:
+            print("  ERROR: journey page " + page.get("id", "?") + " failed, skipping (" + str(e) + ")", file=sys.stderr)
             continue
-        if flight_db:
-            total_flights += rebuild_flight_rows(flight_db, info)
-        if price_db:
-            total_sites += rebuild_price_site_rows(price_db, info)
 
     print("Done. flights +" + str(total_flights) + ", price task rows +" + str(total_sites) + ".")
     print("Result: GitHub Actions completed structure/task building; live price parsing is delegated to Notion AI / manual check / future flight API.")
