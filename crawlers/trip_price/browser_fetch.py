@@ -14,6 +14,8 @@ Notion AI / 人工只作為補查與修正輔助，不再固定負責特定 4 �
 - 擷取：不再只回傳第一個金額（常誤抓到行李加價、保險費等雜訊），
   改為收集前 N 個不重複候選價格，用「 | 」串接後交給 LLM 挑選
 - 導覽失敗自動重試一次（逾時加倍）；擷取前捲動頁面觸發 lazy-load
+- 除錯：比對不到價格時，把頁面標題與內文前 600 字印到 log，
+  用來判斷是 cookie/consent 牆、人機驗證頁，還是價格格式與 regex 不符
 
 深連結產生邏輯直接重用 crawler.py 既有的 build_booking_url() / FLIGHT_PRICE_SITES，
 本檔案不重複維護一份平台 URL 模板。
@@ -255,13 +257,22 @@ def _fetch_once(platform_key: str, url: str, config: Dict[str, Any], nav_timeout
                     except Exception:
                         raw_text = ""
 
+                body_text = ""
                 if not raw_text:
                     body_text = page.inner_text("body")
                     candidates = extract_price_candidates(body_text, price_regex)
                     raw_text = " | ".join(candidates)
 
                 if not raw_text:
-                    print("  [" + platform_key + "] page loaded but no price pattern matched.")
+                    # 除錯（2026-08-07）：比對不到價格時輸出頁面標題與內文前段，
+                    # 用來判斷實際停在 cookie/consent 牆、人機驗證頁，還是價格格式與 regex 不符。
+                    try:
+                        page_title = page.title()
+                    except Exception:
+                        page_title = "(unavailable)"
+                    snippet = re.sub(r"\s+", " ", body_text).strip()[:600]
+                    print("  [" + platform_key + "] page loaded but no price pattern matched. title=" + page_title)
+                    print("  [" + platform_key + "] body snippet: " + snippet)
                     return None
 
                 raw_text = raw_text.strip()
