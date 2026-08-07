@@ -19,6 +19,13 @@ momondo、Booking.com、Expedia、Trip.com、Kiwi、Traveloka、Airpaz 等網站
 
 這樣即使 GitHub Actions 無法解析票價，workflow 仍視為成功，避免整套 Trip 流程因網站反爬而中斷。
 
+2026-08-07 修正：
+- extract_airport_code 新增中英文城市名 → IATA 對照（舊版只認 3 碼英文，
+  From-To 寫「臺北 → 東京」這類中文地名時目的地代碼為空，build_booking_url 防呆
+  回傳網站首頁，所有平台深連結失效）
+- 新增 repair_stale_booking_urls()：既有列若訂票連結仍為首頁/過期且尚未回填票價，
+  重新計算深連結並更新（已有票價的列不動，避免覆寫人工 / AI 查價成果）
+
 Required GitHub Actions secrets:
 - NOTION_TOKEN
 - TRIP_DATABASE_ID
@@ -89,6 +96,48 @@ DEFAULT_AIRLINES: List[Tuple[str, str, str]] = [
     ("China Airlines 中華航空", "www.china-airlines.com", "CI"),
     ("STARLUX Airlines 星宇航空", "www.starlux-airlines.com", "JX"),
 ]
+
+# 中英文城市名 → IATA 機場/城市代碼對照表。
+# Trip 旅程的 From-To 欄位常寫中文地名（例如「臺北 → 東京」），
+# 舊版 extract_airport_code 只認 3 碼大寫英文，導致目的地代碼為空、
+# build_booking_url 防呆回傳首頁，所有平台訂票連結失去深連結功能（2026-08-07 修正）。
+CITY_TO_AIRPORT: Dict[str, str] = {
+    "臺北": "TPE", "台北": "TPE", "taipei": "TPE",
+    "桃園": "TPE", "taoyuan": "TPE",
+    "高雄": "KHH", "kaohsiung": "KHH",
+    "臺中": "RMQ", "台中": "RMQ", "taichung": "RMQ",
+    "東京": "TYO", "tokyo": "TYO",
+    "成田": "NRT", "narita": "NRT",
+    "羽田": "HND", "haneda": "HND",
+    "大阪": "OSA", "osaka": "OSA",
+    "關西": "KIX", "kansai": "KIX",
+    "名古屋": "NGO", "nagoya": "NGO",
+    "福岡": "FUK", "fukuoka": "FUK",
+    "札幌": "SPK", "sapporo": "SPK",
+    "沖繩": "OKA", "那霸": "OKA", "okinawa": "OKA", "naha": "OKA",
+    "曼谷": "BKK", "bangkok": "BKK",
+    "清邁": "CNX", "chiang mai": "CNX",
+    "普吉": "HKT", "phuket": "HKT",
+    "首爾": "SEL", "seoul": "SEL",
+    "仁川": "ICN", "incheon": "ICN",
+    "釜山": "PUS", "busan": "PUS",
+    "香港": "HKG", "hong kong": "HKG",
+    "澳門": "MFM", "macau": "MFM",
+    "新加坡": "SIN", "singapore": "SIN",
+    "吉隆坡": "KUL", "kuala lumpur": "KUL",
+    "馬尼拉": "MNL", "manila": "MNL",
+    "河內": "HAN", "hanoi": "HAN",
+    "胡志明": "SGN", "ho chi minh": "SGN",
+    "雅加達": "CGK", "jakarta": "CGK",
+    "峇里島": "DPS", "峇里": "DPS", "bali": "DPS",
+    "雪梨": "SYD", "sydney": "SYD",
+    "墨爾本": "MEL", "melbourne": "MEL",
+    "洛杉磯": "LAX", "los angeles": "LAX",
+    "舊金山": "SFO", "san francisco": "SFO",
+    "紐約": "NYC", "new york": "NYC",
+    "倫敦": "LON", "london": "LON",
+    "巴黎": "PAR", "paris": "PAR",
+}
 
 
 def env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -255,8 +304,21 @@ def _parse_iso_date(value: str) -> Optional[datetime]:
 
 
 def extract_airport_code(text: str) -> str:
-    match = re.search(r"\b([A-Z]{3})\b", text or "")
-    return match.group(1) if match else ""
+    """從地名字串取 IATA 代碼。
+
+    先找 3 碼大寫英文代碼（如「TPE」）；找不到再查中英文城市對照表
+    （如「東京」→ TYO、「chiang mai」→ CNX）。都找不到回傳空字串。
+    對照表比對時先長後短（「峇里島」優先於「峇里」），避免短名誤吞長名。
+    """
+    text = (text or "").strip()
+    match = re.search(r"\b([A-Z]{3})\b", text)
+    if match:
+        return match.group(1)
+    lowered = text.lower()
+    for name in sorted(CITY_TO_AIRPORT, key=len, reverse=True):
+        if name.lower() in lowered:
+            return CITY_TO_AIRPORT[name]
+    return ""
 
 
 def build_booking_url(site: str, base_url: str, dep: str, arr: str, start: str, end: str) -> str:
@@ -355,6 +417,44 @@ def rebuild_flight_rows(flight_db: str, info: Dict[str, str]) -> int:
     return created
 
 
+def repair_stale_booking_urls(price_db: str, info: Dict[str, str]) -> int:
+    """修正既有平台列的訂票連結。
+
+    2026-08-07 新增：早期因中文地名無法轉 IATA 代碼，既有列的訂票連結
+    退化成網站首頁且永不更新（rebuild_price_site_rows 只補缺不覆寫）。
+    此函式對「尚未回填票價」的既有列重新計算深連結，URL 不同時才 PATCH；
+    已有票價的列一律不動，避免覆寫人工 / AI 查價成果。
+    """
+    if not info["start"]:
+        return 0
+    dep_code = extract_airport_code(info["origin"]) or "TPE"
+    arr_code = extract_airport_code(info["destination"])
+    site_lookup = {site: base_url for site, base_url, _, _ in FLIGHT_PRICE_SITES}
+    repaired = 0
+    for page in query_all_pages(price_db):
+        title = text_prop(page, "網站名稱")
+        site = next((s for s in site_lookup if title.startswith(s)), None)
+        if site is None:
+            continue
+        price_prop = page.get("properties", {}).get("票價", {})
+        if price_prop.get("number") is not None:
+            continue
+        expected = build_booking_url(site, site_lookup[site], dep_code, arr_code, info["start"], info["end"])
+        current = text_prop(page, "訂票連結")
+        if expected and expected != current:
+            http_json(
+                "PATCH",
+                "https://api.notion.com/v1/pages/" + page["id"],
+                {"properties": {"訂票連結": {"url": expected}}},
+            )
+            time.sleep(WRITE_DELAY_SEC)
+            repaired += 1
+            print("  Repaired booking URL for " + site + ".")
+    if repaired:
+        print("  Price sites: repaired " + str(repaired) + " stale booking URL(s).")
+    return repaired
+
+
 def rebuild_price_site_rows(price_db: str, info: Dict[str, str]) -> int:
     if not info["start"]:
         print("  Skip price sites: journey '" + info["title"] + "' has no Trip Date.")
@@ -419,6 +519,7 @@ def main() -> int:
     print("Found " + str(len(journeys)) + " journey task(s) in Trip database.")
     total_flights = 0
     total_sites = 0
+    total_repaired = 0
 
     for page in journeys:
         try:
@@ -433,12 +534,13 @@ def main() -> int:
             if flight_db:
                 total_flights += rebuild_flight_rows(flight_db, info)
             if price_db:
+                total_repaired += repair_stale_booking_urls(price_db, info)
                 total_sites += rebuild_price_site_rows(price_db, info)
         except Exception as e:
             print("  ERROR: journey page " + page.get("id", "?") + " failed, skipping (" + str(e) + ")", file=sys.stderr)
             continue
 
-    print("Done. flights +" + str(total_flights) + ", price task rows +" + str(total_sites) + ".")
+    print("Done. flights +" + str(total_flights) + ", price task rows +" + str(total_sites) + ", booking URLs repaired " + str(total_repaired) + ".")
     print("Result: GitHub Actions completed structure/task building; live price parsing is delegated to Notion AI / manual check / future flight API.")
     return 0
 

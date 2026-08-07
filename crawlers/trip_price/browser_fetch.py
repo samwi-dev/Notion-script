@@ -8,6 +8,13 @@
 GitHub Actions 會對 Trip 票價網站資料的 15 個平台全部嘗試 Playwright + Groq 查價；
 Notion AI / 人工只作為補查與修正輔助，不再固定負責特定 4 個平台。
 
+2026-08-07 強化：
+- 反爬蟲：停用 AutomationControlled、偽裝 zh-TW 語系 / Asia/Taipei 時區、
+  隱藏 navigator.webdriver 指紋、帶 Accept-Language 標頭
+- 擷取：不再只回傳第一個金額（常誤抓到行李加價、保險費等雜訊），
+  改為收集前 N 個不重複候選價格，用「 | 」串接後交給 LLM 挑選
+- 導覽失敗自動重試一次（逾時加倍）；擷取前捲動頁面觸發 lazy-load
+
 深連結產生邏輯直接重用 crawler.py 既有的 build_booking_url() / FLIGHT_PRICE_SITES，
 本檔案不重複維護一份平台 URL 模板。
 
@@ -28,11 +35,35 @@ from crawler import FLIGHT_PRICE_SITES, build_booking_url, extract_airport_code
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
-# 通用價格文字 fallback：抓不到平台專屬 pattern 時，退而求其次抓頁面上第一個看起來像貨幣金額的字串。
+# 反爬蟲啟動參數：移除 headless Chromium 常見的自動化指紋。
+LAUNCH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-dev-shm-usage",
+    "--no-sandbox",
+]
+
+# 偽裝成台灣使用者的瀏覽環境，降低被地區/語系判定攔截的機率。
+CONTEXT_OPTIONS: Dict[str, Any] = {
+    "locale": "zh-TW",
+    "timezone_id": "Asia/Taipei",
+    "viewport": {"width": 1366, "height": 900},
+    "extra_http_headers": {"Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8"},
+}
+
+# 隱藏 navigator.webdriver 等自動化指紋。
+STEALTH_INIT_SCRIPT = (
+    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+    "Object.defineProperty(navigator, 'languages', {get: () => ['zh-TW', 'zh', 'en']});"
+)
+
+# 通用價格文字 fallback：抓不到平台專屬 pattern 時，退而求其次抓頁面上看起來像貨幣金額的字串。
 GENERIC_PRICE_REGEX = r"(?:NT\$|US\$|HK\$|S\$|TWD\s?|THB\s?|JPY\s?|¥|\$)\s?[\d][\d,]{2,7}"
+
+# 擷取時最多收集幾個不重複候選價格（交給 LLM 判斷，而不是只回傳第一個）。
+MAX_PRICE_CANDIDATES = 8
 
 # 平台設定表：wait_selector（等待渲染完成用的 CSS selector，可為 None 只靠 extra_wait_ms）、
 # price_selector（優先用的 CSS selector，抓不到再退用 price_regex）、price_regex（抓不到 selector 時
@@ -40,7 +71,7 @@ GENERIC_PRICE_REGEX = r"(?:NT\$|US\$|HK\$|S\$|TWD\s?|THB\s?|JPY\s?|¥|\$)\s?[\d]
 # 2026-08-06：15 個平台全部列入 Step 3；抓不到則 confidence=0 並保留待補查備註。
 PLATFORM_CONFIG: Dict[str, Dict[str, Any]] = {
     "Google Flights": {
-        "wait_selector": None,
+        "wait_selector": "div[role='main']",
         "price_selector": None,
         "price_regex": r"Cheapest\s+from\s+(?:NT\$|US\$|\$)[\d,]+",
         "timeout": 30000,
@@ -51,7 +82,7 @@ PLATFORM_CONFIG: Dict[str, Dict[str, Any]] = {
         "price_selector": None,
         "price_regex": GENERIC_PRICE_REGEX,
         "timeout": 25000,
-        "extra_wait_ms": 8000,
+        "extra_wait_ms": 10000,
     },
     "Trip.com": {
         "wait_selector": None,
@@ -72,21 +103,21 @@ PLATFORM_CONFIG: Dict[str, Dict[str, Any]] = {
         "price_selector": None,
         "price_regex": GENERIC_PRICE_REGEX,
         "timeout": 25000,
-        "extra_wait_ms": 8000,
+        "extra_wait_ms": 10000,
     },
     "momondo": {
         "wait_selector": None,
         "price_selector": None,
         "price_regex": GENERIC_PRICE_REGEX,
         "timeout": 25000,
-        "extra_wait_ms": 8000,
+        "extra_wait_ms": 10000,
     },
     "Booking.com": {
         "wait_selector": None,
         "price_selector": None,
         "price_regex": GENERIC_PRICE_REGEX,
         "timeout": 25000,
-        "extra_wait_ms": 8000,
+        "extra_wait_ms": 10000,
     },
     "ezTravel 易遊網": {
         "wait_selector": None,
@@ -147,20 +178,50 @@ PLATFORM_CONFIG: Dict[str, Dict[str, Any]] = {
 }
 
 
+def extract_price_candidates(body_text: str, price_regex: str, limit: int = MAX_PRICE_CANDIDATES) -> List[str]:
+    """從整頁文字收集前 N 個不重複的價格候選字串（比對順序即出現順序）。"""
+    normalized = re.sub(r"\s+", " ", body_text)
+    candidates: List[str] = []
+    for match in re.finditer(price_regex, normalized):
+        value = match.group(0).strip()
+        if value not in candidates:
+            candidates.append(value)
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
 def fetch_price(platform_key: str, url: str, timeout: Optional[int] = None) -> Optional[Dict[str, str]]:
-    """開啟 url，等待渲染，擷取價格文字。單平台失敗一律回傳 None（降級，不拋例外）。"""
+    """開啟 url，等待渲染，擷取價格文字。單平台失敗一律回傳 None（降級，不拋例外）。
+
+    導覽失敗會自動重試一次（逾時加倍），提高動態網站在 Actions 環境的成功率。
+    """
     config = PLATFORM_CONFIG.get(platform_key)
     if not config:
         print("  [" + platform_key + "] no PLATFORM_CONFIG entry, skip.", file=sys.stderr)
         return None
 
     try:
-        from playwright.sync_api import sync_playwright  # 延遲載入，避免未安裝 playwright 時整檔案 import 失敗
+        from playwright.sync_api import sync_playwright  # noqa: F401 延遲載入，避免未安裝 playwright 時整檔案 import 失敗
     except ImportError as e:
         print("  [" + platform_key + "] playwright not installed: " + str(e), file=sys.stderr)
         return None
 
     nav_timeout = timeout or config.get("timeout", 20000)
+
+    for attempt in range(2):
+        result = _fetch_once(platform_key, url, config, nav_timeout * (attempt + 1))
+        if result is not None:
+            return result
+        if attempt == 0:
+            print("  [" + platform_key + "] first attempt failed, retrying once with doubled timeout...")
+    return None
+
+
+def _fetch_once(platform_key: str, url: str, config: Dict[str, Any], nav_timeout: int) -> Optional[Dict[str, str]]:
+    """單次擷取嘗試；任何例外都回傳 None 由 fetch_price 決定是否重試。"""
+    from playwright.sync_api import sync_playwright
+
     extra_wait_ms = config.get("extra_wait_ms", 8000)
     wait_selector = config.get("wait_selector")
     price_selector = config.get("price_selector")
@@ -168,9 +229,11 @@ def fetch_price(platform_key: str, url: str, timeout: Optional[int] = None) -> O
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=True, args=LAUNCH_ARGS)
             try:
-                page = browser.new_page(user_agent=USER_AGENT)
+                context = browser.new_context(user_agent=USER_AGENT, **CONTEXT_OPTIONS)
+                context.add_init_script(STEALTH_INIT_SCRIPT)
+                page = context.new_page()
                 page.goto(url, timeout=nav_timeout, wait_until="domcontentloaded")
                 if wait_selector:
                     try:
@@ -178,6 +241,12 @@ def fetch_price(platform_key: str, url: str, timeout: Optional[int] = None) -> O
                     except Exception:
                         pass
                 page.wait_for_timeout(extra_wait_ms)
+                # 捲動頁面觸發 lazy-load（部分比價網站的價格區塊要捲動才渲染）
+                try:
+                    page.mouse.wheel(0, 2500)
+                    page.wait_for_timeout(2000)
+                except Exception:
+                    pass
 
                 raw_text = ""
                 if price_selector:
@@ -188,9 +257,8 @@ def fetch_price(platform_key: str, url: str, timeout: Optional[int] = None) -> O
 
                 if not raw_text:
                     body_text = page.inner_text("body")
-                    normalized = re.sub(r"\s+", " ", body_text)
-                    match = re.search(price_regex, normalized)
-                    raw_text = match.group(0) if match else ""
+                    candidates = extract_price_candidates(body_text, price_regex)
+                    raw_text = " | ".join(candidates)
 
                 if not raw_text:
                     print("  [" + platform_key + "] page loaded but no price pattern matched.")

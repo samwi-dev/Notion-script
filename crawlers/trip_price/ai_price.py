@@ -10,6 +10,9 @@ Step 3：對 Trip「票價網站資料」15 個平台全部嘗試 Playwright + G
 2026-08-06 更新：取消 11 + 4 固定分工，全部平台合併由 GitHub Actions Step 3 嘗試。
 Notion AI / 人工只作為補查與修正輔助；不再固定負責 EVA / Kiwi / Traveloka / Airpaz。
 
+2026-08-07 更新：browser_fetch 回傳格式改為「多個候選價格以 | 分隔」，prompt 配合說明，
+讓 LLM 從候選中挑選最符合路線與日期的票價，而非被迫接受單一可能誤判的金額。
+
 Notion API 呼叫沿用 crawler.py 既有 helper，不重新發明一份 Notion API 邏輯。
 
 Required secrets:
@@ -67,10 +70,11 @@ def normalize_price(client: Any, platform: str, raw_text: str, route_hint: str) 
     """把 browser_fetch 擷取到的原始價格文字正規化成結構化 JSON；LLM 失敗時降級保留原始文字，不中斷整批。"""
     prompt = (
         "你是機票比價資料正規化助手。以下是從訂票網站「" + platform + "」頁面實際擷取到的原始文字"
-        "（可能包含雜訊、多個價格或不完整資訊），請判斷其中最相關的票價，並以 JSON 回傳結構化結果（notes 請用繁體中文）：\n\n"
+        "（可能包含多個以「 | 」分隔的候選價格、雜訊或不完整資訊），請判斷其中最相關的票價，並以 JSON 回傳結構化結果（notes 請用繁體中文）：\n\n"
         "原始擷取文字：\n" + raw_text[:1500] + "\n\n"
         "路線與需求提示：" + route_hint + "\n\n"
         "判斷重點：\n"
+        "- 若原始文字以「 | 」分隔多個候選價格，請從中挑選最符合上述路線與日期需求的機票票價；留意排除行李加價、保險費、訂閱費等非票價金額\n"
         "- 找出最符合上述路線與日期需求的票價數字與幣別（若原始文字包含多個價格，選最低或最相關的一個）\n"
         "- 換算為台幣（price_twd）；若原始幣別已是 TWD 則直接帶入，否則用你所知的約略匯率換算並在 notes 註明換算依據\n"
         "- is_dynamic_estimate：若原始文字明顯只是「起價」「日曆最低價」等估計值，而非該確切航班／日期的即時完整報價，標記為 true\n\n"
