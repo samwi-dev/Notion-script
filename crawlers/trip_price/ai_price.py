@@ -10,8 +10,12 @@ Step 3：對 Trip「票價網站資料」15 個平台全部嘗試 Playwright + G
 2026-08-06 更新：取消 11 + 4 固定分工，全部平台合併由 GitHub Actions Step 3 嘗試。
 Notion AI / 人工只作為補查與修正輔助；不再固定負責 EVA / Kiwi / Traveloka / Airpaz。
 
-2026-08-07 更新：browser_fetch 回傳格式改為「多個候選價格以 | 分隔」，prompt 配合說明，
-讓 LLM 從候選中挑選最符合路線與日期的票價，而非被迫接受單一可能誤判的金額。
+2026-08-07 更新：
+- browser_fetch 回傳格式改為「多個候選價格以 | 分隔」，prompt 配合說明，
+  讓 LLM 從候選中挑選最符合路線與日期的票價，而非被迫接受單一可能誤判的金額
+- 已有票價的列直接跳過（「已有數字就不要動」），避免自動查價失敗的備註覆蓋人工查價成果
+- prompt 加入合理性檢查：國際線來回票價明顯過低（如低於 TWD 3,000）極可能是誤抓
+  單日最低價 / 行李費 / 保險費等非票價金額，此時應回傳 null 而非硬挑最低候選
 
 Notion API 呼叫沿用 crawler.py 既有 helper，不重新發明一份 Notion API 邏輯。
 
@@ -76,6 +80,8 @@ def normalize_price(client: Any, platform: str, raw_text: str, route_hint: str) 
         "判斷重點：\n"
         "- 若原始文字以「 | 」分隔多個候選價格，請從中挑選最符合上述路線與日期需求的機票票價；留意排除行李加價、保險費、訂閱費等非票價金額\n"
         "- 找出最符合上述路線與日期需求的票價數字與幣別（若原始文字包含多個價格，選最低或最相關的一個）\n"
+        "- 合理性檢查：國際線來回機票若換算後低於約 TWD 3,000，極可能是誤抓到非票價金額（日曆單日最低價、行李費、保險費、訂閱費等），"
+        "此時 price_local 與 price_twd 應回傳 null、confidence 設為 0，並在 notes 說明懷疑誤抓的原因\n"
         "- 換算為台幣（price_twd）；若原始幣別已是 TWD 則直接帶入，否則用你所知的約略匯率換算並在 notes 註明換算依據\n"
         "- is_dynamic_estimate：若原始文字明顯只是「起價」「日曆最低價」等估計值，而非該確切航班／日期的即時完整報價，標記為 true\n\n"
         "請回傳純 JSON（不要 markdown code block）：\n"
@@ -150,6 +156,13 @@ def process_price_db(client: Optional[Any], price_db_id: str, info: Dict[str, st
             site_title = text_prop(row, "網站名稱")
             site_name = site_title.split("｜")[0].strip() if "｜" in site_title else site_title
             if site_name not in PLATFORM_CONFIG:
+                continue
+
+            # 「已有數字就不要動」：票價欄已有值的列直接跳過，
+            # 避免自動查價失敗的備註覆蓋人工 / AI 已查到的價格成果（2026-08-07 新增）。
+            existing_price = row.get("properties", {}).get("票價", {}).get("number")
+            if existing_price is not None:
+                print("  [" + site_name + "] skip (已有票價 " + str(existing_price) + "，保留既有查價成果)")
                 continue
 
             booking_url = text_prop(row, "訂票連結")
