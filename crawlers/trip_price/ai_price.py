@@ -171,7 +171,7 @@ def process_price_db(client: Optional[Any], price_db_id: str, info: Dict[str, st
                 continue
 
             print("  [" + site_name + "] fetching via browser_fetch...")
-            fetched = fetch_price(site_name, booking_url)
+            fetched = fetch_price(site_name, booking_url, journey_info=info)
 
             if fetched is None:
                 result: Dict[str, Any] = {

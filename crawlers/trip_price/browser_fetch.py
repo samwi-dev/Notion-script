@@ -17,6 +17,18 @@ Notion AI / 人工只作為補查與修正輔助，不再固定負責特定 4 �
 - 除錯：比對不到價格時，把頁面標題與內文前 600 字印到 log，
   用來判斷是 cookie/consent 牆、人機驗證頁，還是價格格式與 regex 不符
 
+2026-08-08 強化（反偵測與效能）：
+- 引擎切換：優先使用 patchright（在 CDP 協定層處理掉常見自動化偵測訊號），import 失敗
+  才 fallback 回原本的 playwright；patchright 分支刻意不疊加手動 STEALTH_INIT_SCRIPT 與
+  --disable-blink-features=AutomationControlled，避免疊加後反而製造出 patchright 原本
+  就避開的可偵測特徵
+- 等待邏輯：wait_for_timeout 死等固定秒數，改為事件驅動的 _wait_for_price_or_timeout()，
+  候選價格連續兩輪不再變動就提早結束，抓不到才等滿原本的秒數（最壞情況與今天一樣）
+- Google Flights 改走 fast_flights_fetch.py（fast-flights 套件）直接取結構化報價，不必
+  真的開頁；失敗才 fallback 回 Playwright/Patchright 開頁擷取（兩層 fallback）
+- 新增 SCRAPE_PROXY_URL / SCRAPE_PROXY_USERNAME / SCRAPE_PROXY_PASSWORD 代理掛鉤，
+  未設定時行為與今天完全相同
+
 深連結產生邏輯直接重用 crawler.py 既有的 build_booking_url() / FLIGHT_PRICE_SITES，
 本檔案不重複維護一份平台 URL 模板。
 
@@ -33,7 +45,16 @@ import re
 import sys
 from typing import Any, Dict, List, Optional
 
-from crawler import FLIGHT_PRICE_SITES, build_booking_url, extract_airport_code
+from crawler import FLIGHT_PRICE_SITES, build_booking_url, env, extract_airport_code
+
+# 引擎切換：優先用 patchright（CDP 層已處理掉常見自動化偵測訊號），
+# import 失敗（環境未安裝）才 fallback 回原本的 playwright。
+try:
+    from patchright.sync_api import sync_playwright
+    _ENGINE = "patchright"
+except ImportError:
+    from playwright.sync_api import sync_playwright
+    _ENGINE = "playwright"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -41,8 +62,9 @@ USER_AGENT = (
 )
 
 # 反爬蟲啟動參數：移除 headless Chromium 常見的自動化指紋。
+# --disable-blink-features=AutomationControlled 只在 playwright（fallback）引擎套用，
+# patchright 已在 CDP 協定層處理掉這個訊號，見下方 LAUNCH_ARGS 組裝與 _fetch_once()。
 LAUNCH_ARGS = [
-    "--disable-blink-features=AutomationControlled",
     "--disable-dev-shm-usage",
     "--no-sandbox",
 ]
@@ -78,6 +100,8 @@ PLATFORM_CONFIG: Dict[str, Dict[str, Any]] = {
         "price_regex": r"Cheapest\s+from\s+(?:NT\$|US\$|\$)[\d,]+",
         "timeout": 30000,
         "extra_wait_ms": 15000,
+        # 2026-08-08：優先走 fast_flights_fetch.py 直接取結構化報價，失敗才 fallback 回這裡的開頁擷取設定。
+        "engine": "fast_flights",
     },
     "Skyscanner": {
         "wait_selector": None,
@@ -193,21 +217,62 @@ def extract_price_candidates(body_text: str, price_regex: str, limit: int = MAX_
     return candidates
 
 
-def fetch_price(platform_key: str, url: str, timeout: Optional[int] = None) -> Optional[Dict[str, str]]:
+def _wait_for_price_or_timeout(page: Any, price_regex: str, max_wait_ms: int) -> None:
+    """事件驅動等待，取代死等固定秒數。
+
+    每 1.5 秒讀一次頁面文字，跑 extract_price_candidates()；如果連續兩輪拿到的候選價格
+    清單完全相同且非空，就提早結束，不必等滿 max_wait_ms。逾時就直接 return（不拋例外），
+    讓呼叫端用當下畫面繼續走既有流程 —— 最壞情況跟死等固定秒數的舊行為完全一樣。
+    """
+    poll_ms = 1500
+    elapsed = 0
+    previous: Optional[List[str]] = None
+    while elapsed < max_wait_ms:
+        page.wait_for_timeout(poll_ms)
+        elapsed += poll_ms
+        try:
+            body_text = page.inner_text("body")
+        except Exception:
+            continue
+        candidates = extract_price_candidates(body_text, price_regex)
+        if candidates and candidates == previous:
+            return
+        previous = candidates
+
+
+def fetch_price(
+    platform_key: str,
+    url: str,
+    timeout: Optional[int] = None,
+    journey_info: Optional[Dict[str, str]] = None,
+) -> Optional[Dict[str, str]]:
     """開啟 url，等待渲染，擷取價格文字。單平台失敗一律回傳 None（降級，不拋例外）。
 
     導覽失敗會自動重試一次（逾時加倍），提高動態網站在 Actions 環境的成功率。
+
+    2026-08-08：platform_key 設定 engine="fast_flights"（目前只有 Google Flights）時，
+    先嘗試 fast_flights_fetch.fetch_google_flights_price() 直接取結構化報價；
+    失敗（套件未安裝、journey_info 缺資料、或 API 呼叫例外）不 return，
+    直接落到下方原本的 Playwright/Patchright 開頁流程（兩層 fallback）。
     """
     config = PLATFORM_CONFIG.get(platform_key)
     if not config:
         print("  [" + platform_key + "] no PLATFORM_CONFIG entry, skip.", file=sys.stderr)
         return None
 
-    try:
-        from playwright.sync_api import sync_playwright  # noqa: F401 延遲載入，避免未安裝 playwright 時整檔案 import 失敗
-    except ImportError as e:
-        print("  [" + platform_key + "] playwright not installed: " + str(e), file=sys.stderr)
-        return None
+    if config.get("engine") == "fast_flights":
+        if journey_info is None:
+            print("  [" + platform_key + "] fast_flights engine configured but no journey_info given, fallback to " + _ENGINE + ".")
+        else:
+            try:
+                from fast_flights_fetch import fetch_google_flights_price
+                ff_result = fetch_google_flights_price(journey_info)
+            except Exception as e:
+                print("  [" + platform_key + "] fast_flights_fetch failed unexpectedly: " + str(e), file=sys.stderr)
+                ff_result = None
+            if ff_result is not None:
+                return ff_result
+            print("  [" + platform_key + "] fast-flights unavailable, falling back to " + _ENGINE + " browser flow...")
 
     nav_timeout = timeout or config.get("timeout", 20000)
 
@@ -222,19 +287,38 @@ def fetch_price(platform_key: str, url: str, timeout: Optional[int] = None) -> O
 
 def _fetch_once(platform_key: str, url: str, config: Dict[str, Any], nav_timeout: int) -> Optional[Dict[str, str]]:
     """單次擷取嘗試；任何例外都回傳 None 由 fetch_price 決定是否重試。"""
-    from playwright.sync_api import sync_playwright
+    print("  [" + platform_key + "] engine=" + _ENGINE)
 
     extra_wait_ms = config.get("extra_wait_ms", 8000)
     wait_selector = config.get("wait_selector")
     price_selector = config.get("price_selector")
     price_regex = config.get("price_regex") or GENERIC_PRICE_REGEX
 
+    # patchright 已在 CDP 協定層處理掉 AutomationControlled 訊號，不再疊加這個啟動參數；
+    # 只有 fallback 用的 playwright 才需要手動加這個參數。
+    launch_args = LAUNCH_ARGS if _ENGINE == "patchright" else LAUNCH_ARGS + ["--disable-blink-features=AutomationControlled"]
+
+    launch_kwargs: Dict[str, Any] = {"headless": True, "args": launch_args}
+    proxy_url = env("SCRAPE_PROXY_URL")
+    if proxy_url:
+        proxy_config: Dict[str, str] = {"server": proxy_url}
+        proxy_username = env("SCRAPE_PROXY_USERNAME")
+        proxy_password = env("SCRAPE_PROXY_PASSWORD")
+        if proxy_username:
+            proxy_config["username"] = proxy_username
+        if proxy_password:
+            proxy_config["password"] = proxy_password
+        launch_kwargs["proxy"] = proxy_config
+
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=LAUNCH_ARGS)
+            browser = p.chromium.launch(**launch_kwargs)
             try:
                 context = browser.new_context(user_agent=USER_AGENT, **CONTEXT_OPTIONS)
-                context.add_init_script(STEALTH_INIT_SCRIPT)
+                # patchright 已在 CDP 協定層處理掉這些自動化指紋，不再疊加手動 JS patch，
+                # 避免疊加後反而製造出 patchright 原本就避開的可偵測特徵；只有 playwright（fallback）才套用。
+                if _ENGINE == "playwright":
+                    context.add_init_script(STEALTH_INIT_SCRIPT)
                 page = context.new_page()
                 page.goto(url, timeout=nav_timeout, wait_until="domcontentloaded")
                 if wait_selector:
@@ -242,7 +326,7 @@ def _fetch_once(platform_key: str, url: str, config: Dict[str, Any], nav_timeout
                         page.wait_for_selector(wait_selector, timeout=nav_timeout)
                     except Exception:
                         pass
-                page.wait_for_timeout(extra_wait_ms)
+                _wait_for_price_or_timeout(page, price_regex, extra_wait_ms)
                 # 捲動頁面觸發 lazy-load（部分比價網站的價格區塊要捲動才渲染）
                 try:
                     page.mouse.wheel(0, 2500)
@@ -298,7 +382,7 @@ def fetch_all_for_journey(info: Dict[str, str]) -> List[Dict[str, str]]:
             print("  [" + platform_key + "] not found in crawler.FLIGHT_PRICE_SITES, skip.", file=sys.stderr)
             continue
         url = build_booking_url(platform_key, base_url, dep_code, arr_code, info.get("start", ""), info.get("end", ""))
-        result = fetch_price(platform_key, url)
+        result = fetch_price(platform_key, url, journey_info=info)
         if result:
             results.append(result)
     return results
