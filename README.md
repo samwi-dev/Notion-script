@@ -10,11 +10,13 @@
 
 1. **Step 1（`crawler.py`）** — 讀取 Trip database 的每個 Journey Task，建立「航班追蹤」「票價網站
    資料」子資料庫結構，產生各平台正確的訂票深連結。
-2. **Step 2（Notion AI Agent）** — 對 Notion AI Agent 能查到精確價的平台（Kiwi.com、Traveloka、
-   Airpaz、EVA Air 等），戳動觸發屬性請 Notion 內建 AI Agent 查價回填。
-3. **Step 3（`browser_fetch.py` + `ai_price.py`）** — 對 Notion AI Agent 查不到精確價的動態渲染
-   平台（Google Flights、Skyscanner、Trip.com、KAYAK、Expedia、momondo、Booking.com、
-   ezTravel、中華航空、星宇航空、AirAsia），用 Playwright headless Chromium 實際開頁擷取價格文字，
+2. **Step 2（Notion AI Agent）** — 每週一或手動觸發時戳動觸發屬性，通知 Notion 內建 AI Agent 補查、
+   修正票價，作為輔助手段，不再固定負責特定平台。
+3. **Step 3（`browser_fetch.py` + `ai_price.py`）** — 對 15 個平台（Google Flights、Skyscanner、
+   Trip.com、KAYAK、Expedia、momondo、Booking.com、ezTravel、EVA Air、中華航空、星宇航空、
+   AirAsia、Kiwi.com、Traveloka、Airpaz）全部合併不分工嘗試查價：Google Flights 優先用
+   fast-flights 套件直接取結構化報價，其餘與 fast-flights 失敗時的 Google Flights 一樣，用
+   patchright（失敗才 fallback playwright）headless Chromium 實際開頁擷取價格文字，
    再用 Groq 正規化成結構化資料寫回 Notion。
 
 詳細說明見 [`crawlers/trip_price/README.md`](crawlers/trip_price/README.md) 與
@@ -41,6 +43,9 @@ Repo → **Settings → Secrets and variables → Actions → New repository sec
 | `NOTION_TOKEN` | ✅ | Notion Integration Secret（`ntn_` 開頭） |
 | `TRIP_DATABASE_ID` | ✅ | Trip 資料庫 ID |
 | `GROQ_API_KEY` | ✅（Step 3 用） | Groq API Key，用於價格文字正規化；未設定時 Step 3 仍會擷取但不做 LLM 正規化 |
+| `SCRAPE_PROXY_URL` | 選填 | 代理伺服器位址；未設定時行為與不用代理完全相同 |
+| `SCRAPE_PROXY_USERNAME` | 選填（可選加開） | 代理伺服器帳號，`SCRAPE_PROXY_URL` 需要帳密驗證時才設定 |
+| `SCRAPE_PROXY_PASSWORD` | 選填（可選加開） | 代理伺服器密碼，`SCRAPE_PROXY_URL` 需要帳密驗證時才設定 |
 
 > ⚠️ 舊版 `ai_price.py` 曾規劃用 Amadeus Flight Offers Search API 查價，但從未真正接入 workflow，
 > 且該 API 已於 2026-07-17 停用。目前已全面改用 Playwright + Groq，`AMADEUS_API_KEY` /
