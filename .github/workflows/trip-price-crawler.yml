@@ -24,10 +24,13 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python dependencies
-        run: pip install playwright groq
+        run: pip install playwright patchright groq fast-flights
 
       - name: Install Playwright Chromium
         run: playwright install chromium --with-deps
+
+      - name: Install Patchright Chromium
+        run: patchright install chromium --with-deps
 
       - name: Step 1 — Build structure and price task rows
         id: step1
@@ -65,6 +68,11 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           TRIP_DATABASE_ID: ${{ secrets.TRIP_DATABASE_ID }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          # 選填：代理伺服器掛鉤（2026-08-08 新增）。未建立這三個 repo secret 時會解析成空字串，
+          # crawler.env() 已把空字串當未設定處理，不影響現有行為。
+          SCRAPE_PROXY_URL: ${{ secrets.SCRAPE_PROXY_URL }}
+          SCRAPE_PROXY_USERNAME: ${{ secrets.SCRAPE_PROXY_USERNAME }}
+          SCRAPE_PROXY_PASSWORD: ${{ secrets.SCRAPE_PROXY_PASSWORD }}
         run: |
           if [ "${{ steps.step1.outcome }}" != "success" ]; then
             echo "Step 1 失敗，略過 Step 3，請檢查 GitHub Actions 記錄"
